@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holoveil-train"
+version = "0.5.2"
+description = "Training, Phase 0 PoC screening, and parity verification suite for holoveil (DESIGN.md v0.5.2-design)"
+requires-python = ">=3.10,<3.14"
+license = { text = "MIT OR Apache-2.0" }
+dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.26.0",
+    "pillow>=10.2.0",
+    "pyyaml>=6.0.1",
+    "safetensors>=0.4.2",
+    "diffusers>=0.27.0",
+    "transformers>=4.38.0",
+    "accelerate>=0.27.0",
+    "huggingface-hub>=0.21.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "lpips>=0.1.4",
+    "pyiqa>=0.1.10",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+holoveil-phase0a = "holoveil_train.poc_screen:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["holoveil_train*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.holoveil]
+design_version = "0.5.2-design"
+default_seed = 42

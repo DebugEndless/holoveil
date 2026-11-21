@@ -1,0 +1,90 @@
+# Phase 0a: Target Validation & Pareto Screening Configuration
+# Conforms strictly to docs/DESIGN.md (Version 0.5.2-design)
+
+seed: 42
+design_version: "0.5.2-design"
+
+model:
+  sd15_model_id: "stable-diffusion-v1-5/stable-diffusion-v1-5"
+  sd15_revision: null # Resolved at runtime and logged with commit SHA
+  sdxl_vae_id: "madebyollin/sdxl-vae-fp16-fix"
+  flux_vae_id: "black-forest-labs/FLUX.1-schnell"
+  flux_vae_subfolder: "vae"
+  enable_flux_vae: true
+  torch_dtype: "bf16" # Auto-falls back to fp32 on CPU
+
+target_field:
+  master_size: 2048
+  margin_size: 256
+  raw_size: 2560
+  eval_margin: 128
+  ell_c_candidates_px: [48, 96, 160]
+  autocorr_deltas_px: [0, 8, 16, 32, 48, 64]
+  autocorr_min_rho_at_32px: 0.50
+  stitch_window_size: 512
+  stitch_stride: 256
+  stitch_discard_latent_border: 8
+  stitch_cosine_ramp_latent: 16
+  stitch_num_random_samples: 20
+  stitch_min_cosine: 0.90
+  rt_num_timesteps: 20
+  rt_num_noises: 5
+  rt_timestep_min: 25
+  rt_timestep_max: 975
+  rt_eval_batch_size: 8
+  discrete_scales: [0.50, 1.00, 1.15, 1.30, 1.50, 1.75, 2.00, 2.25, 2.50]
+
+color_mask:
+  eta_y_255: 12.0
+  fixed_chroma_ratio: 0.40
+  tex_ref_long_side: 512
+  tex_box_radius: 4
+  tex_sigma_lo: 0.012
+  tex_sigma_hi: 0.080
+  tex_m_min: 0.30
+  gf_radius: 8
+  gf_eps: 0.001
+  anti_clamp_margin_255: 24.0
+  anti_clamp_min_filter_size: 3
+  no_op_eps_255: 0.001
+  chroma_lp_sigma: 3.0
+  max_direct_pixels: 1150000
+
+step2_screen:
+  pgd_steps: 100
+  pgd_step_size_start: 0.12
+  pgd_step_size_end: 0.02
+  alpha_vae: 0.35
+  vae_weights:
+    sd15: 0.2
+    sdxl: 0.5
+    flux: 0.5
+  ema_trp_decay: 0.99
+  lambda_values: [0.65, 0.72, 0.85, 1.00]
+  beta_chroma_values: [1.0, 2.0, 4.0]
+  scale_targets: ["Standard512", "Bucket1024"]
+  lpid_candidate_scales: [1.15, 1.30, 1.50, 1.75, 2.00]
+  lpid_low_sizes: [112, 160, 224, 256]
+  bucket1024_candidate_scales: [1.50, 1.75, 2.00, 2.25, 2.50]
+  bucket1024_max_scaled_pixels: 1200000
+  eval_jpeg_quality: 75
+  purification_probs_512:
+    Identity: 0.15
+    DiffJPEG_STE: 0.20
+    BilinearDownUp: 0.15
+    GaussianNoise: 0.15
+    LPID_CropResize: 0.20
+    Bucket1024Scale: 0.15
+  purification_probs_1024:
+    Identity: 0.20
+    DiffJPEG_STE: 0.20
+    BilinearDownUp: 0.15
+    GaussianNoise: 0.10
+    Downscale05x_SD15: 0.20
+    LPID_CropResize: 0.15
+  invisibility_gates:
+    min_psnr_db: 35.0
+    max_lpips: 0.15
+    min_ssimulacra2: 82.0
+    max_flat_delta_e2000_p95: 2.5
+  top_k_pareto: 3

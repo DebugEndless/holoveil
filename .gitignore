@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.installed.cfg
+*.egg
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Model weights, checkpoints, datasets, outputs
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+outputs/
+checkpoints/
+logs/
+wandb/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
