@@ -10,7 +10,7 @@ import torch
 
 __version__ = "0.5.2"
 
-DESIGN_VERSION = "0.5.2-design"
+DESIGN_VERSION = "0.5.3-design"
 DEFAULT_SEED = 42
 
 

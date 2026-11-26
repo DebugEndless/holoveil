@@ -33,6 +33,7 @@ htmlcov/
 *.pt
 *.pth
 *.bin
+!assets/blue_noise_64x64_u16le.bin
 *.onnx
 outputs/
 checkpoints/

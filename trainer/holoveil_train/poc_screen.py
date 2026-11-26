@@ -425,6 +425,7 @@ def _make_step1_markdown(report: dict[str, Any]) -> str:
         f"- **Mode**: `{'DRY-RUN SYNTHETIC' if report['dry_run_synthetic'] else 'REAL SD 1.5'}`",
         f"- **Selected Correlation Length $\\ell_c^*$**: `{report['selected_ell_c_px']}` px",
         f"- **Fallback Grid-Snap (256px) Recommended**: `{report['fallback_grid_snap_recommended']}`",
+        f"- **Antithetic Variates (`+eps, -eps`)**: `{report.get('antithetic_variates', True)}` | **Global Noise Shared**: `{report.get('share_global_noise', True)}`",
         "",
         "## Gate 1: Window Stitching Fidelity (`verify_rt_stitch_fidelity`, Threshold >= 0.90)",
         "",
@@ -488,7 +489,9 @@ def run_step1(
     min_cos = float(tf_cfg.get("stitch_min_cosine", STITCH_COSINE_THRESHOLD))
     num_samples = int(tf_cfg.get("stitch_num_random_samples", 20))
     num_t = int(tf_cfg.get("rt_num_timesteps", 20))
-    num_n = int(tf_cfg.get("rt_num_noises", 5))
+    num_n = int(tf_cfg.get("rt_num_noises", 6))
+    use_antithetic = bool(tf_cfg.get("use_antithetic_variates", True))
+    share_global_noise = bool(tf_cfg.get("share_global_noise_step1", True))
     batch_size = int(tf_cfg.get("rt_eval_batch_size", 8))
 
     if dry_run_synthetic:
@@ -504,6 +507,8 @@ def run_step1(
             num_timesteps=num_t,
             num_noises=num_n,
             batch_size=batch_size,
+            antithetic=use_antithetic,
+            share_global_noise=share_global_noise,
             device="cpu",
         )
         stitch_res = verify_rt_stitch_fidelity(
@@ -516,6 +521,8 @@ def run_step1(
             num_timesteps=num_t,
             num_noises=num_n,
             batch_size=batch_size,
+            antithetic=use_antithetic,
+            share_global_noise=share_global_noise,
         )
         autocorr_res = measure_rt_autocorrelation(
             r_t_master=r_t_1_0,
@@ -540,6 +547,8 @@ def run_step1(
         "sd15_model_id": cfg["model"]["sd15_model_id"],
         "sd15_revision": getattr(surrogate, "sd15_revision", "unknown"),
         "seed": seed,
+        "antithetic_variates": use_antithetic,
+        "share_global_noise": share_global_noise,
         "elapsed_sec": round(time.time() - t0, 2),
         "ell_c_candidates_px": ell_c_list,
         "selected_ell_c_px": selected_ell_c,
@@ -581,6 +590,17 @@ def _generate_synthetic_images() -> list[dict[str, Any]]:
     return imgs
 
 
+def _infer_domain_from_path(p: Path) -> str:
+    low = str(p).lower()
+    if any(k in low for k in ("illust", "anime", "lineart", "manga")):
+        return "illustration"
+    if any(k in low for k in ("paint", "art")):
+        return "painting"
+    if any(k in low for k in ("photo", "face", "portrait")):
+        return "photo"
+    return "unknown"
+
+
 def _load_real_images(image_dir: Path) -> list[dict[str, Any]]:
     exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     files = sorted([p for p in image_dir.rglob("*") if p.suffix.lower() in exts])
@@ -592,7 +612,7 @@ def _load_real_images(image_dir: Path) -> list[dict[str, Any]]:
             rgb = im.convert("RGB")
             arr = np.asarray(rgb, dtype=np.float32) / 255.0
             t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
-            loaded.append({"name": p.stem, "path": str(p), "rgb": t})
+            loaded.append({"name": p.stem, "path": str(p), "domain": _infer_domain_from_path(p), "rgb": t})
     return loaded
 
 
@@ -653,13 +673,14 @@ def _make_step2_markdown(report: dict[str, Any]) -> str:
         f"- **Design Version**: `{report['design_version']}`",
         f"- **Mode**: `{'DRY-RUN SYNTHETIC' if report['dry_run_synthetic'] else 'REAL SD 1.5 + MULTI-VAE'}`",
         f"- **Selected $\\ell_c^*$**: `{report['ell_c_px']}` px",
+        f"- **Optimizer**: `{report.get('optimizer', 'projected_adam')}` | **EoT Identity Pairing**: `{report.get('eot_always_include_identity', True)}`",
         f"- **Fallback Grid Snap (256px)**: `{report['snap_to_256_grid']}`",
         f"- **Num Images**: `{report['num_images']}` | **PGD Steps**: `{report['pgd_steps']}` | **Fixed $\\alpha_{{\\text{{vae}}}}$**: `{report['alpha_vae']}`",
         "",
         "## Top-3 Pareto Configurations",
         "",
-        "| Rank | ScaleTarget | $\\lambda$ | $\\beta_{\\text{chroma}}$ | PSNR (dB) | Flat $\\Delta E_{2000}$ p95 | Max $|\\delta_{\\text{RGB}}|_{255}$ | $\\rho_{\\text{LF}}$ | TRP cos (JPEG75) | TRP cos (LPID) | Proxy Score |",
-        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        "| Rank | ScaleTarget | $\\lambda$ | $\\beta_{\\text{chroma}}$ | PSNR (dB) | Active Flat $\\Delta E_{2000}$ p95 | Max $|\\delta_{\\text{RGB}}|_{255}$ | $\\rho_{\\text{LF}}$ | Checker Peak | TRP cos (JPEG75) | TRP cos (LPID) | Proxy Score |",
+        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
     if not report["top_pareto"]:
         lines.append("> **No configuration satisfied all invisibility gates.** Review the full sweep table below.")
@@ -669,26 +690,40 @@ def _make_step2_markdown(report: dict[str, Any]) -> str:
             f"| {idx} | {rec['scale_target']} | {rec['lambda']:.2f} | {rec['beta_chroma']:.1f} | "
             f"{rec['mean_psnr_db']:.2f} | {rec['mean_flat_delta_e2000_p95']:.3f} | "
             f"{rec['mean_max_abs_delta_rgb_255']:.2f} | {rec['mean_rho_lf']:.3f} | "
+            f"{rec.get('mean_work_checkerboard_peak_to_median', 0.0):.2f} | "
             f"{rec['proxy_trp_cos_jpeg75']:.4f} | {rec['proxy_trp_cos_lpid']:.4f} | "
             f"{rec['proxy_protection_score']:.4f} |"
         )
+    if report.get("top_by_scale_target"):
+        lines.extend(["", "### Best Configuration per ScaleTarget", ""])
+        for st_name, rec in report["top_by_scale_target"].items():
+            if rec is None:
+                lines.append(f"- **{st_name}**: No configuration passed gates.")
+            else:
+                lines.append(
+                    f"- **{st_name}**: $\\lambda={rec['lambda']:.2f}$, $\\beta_{{\\text{{chroma}}}}={rec['beta_chroma']:.1f}$, "
+                    f"PSNR `{rec['mean_psnr_db']:.2f}` dB, Active Flat $\\Delta E_{{2000}}$ p95 `{rec['mean_flat_delta_e2000_p95']:.3f}`, "
+                    f"Proxy Score `{rec['proxy_protection_score']:.4f}`"
+                )
     lines.extend(
         [
             "",
             "## All Sweep Configurations",
             "",
-            "| ScaleTarget | $\\lambda$ | $\\beta_{\\text{chroma}}$ | Gates | PSNR (dB) | Flat $\\Delta E_{2000}$ p95 | Max $|\\delta_{\\text{RGB}}|_{255}$ | $\\rho_{\\text{LF}}$ | TRP cos (JPEG75) | TRP cos (LPID) | Proxy Score |",
-            "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            "| ScaleTarget | $\\lambda$ | $\\beta_{\\text{chroma}}$ | Gates | Illus Gate | PSNR (dB) | Active Flat $\\Delta E_{2000}$ p95 | $\\rho_{\\text{LF}}$ | TRP cos (JPEG75) | TRP cos (LPID) | VAE L2 (sd15/sdxl/flux) | Proxy Score |",
+            "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ]
     )
     for rec in report["all_configs"]:
         gate_str = "PASS" if rec["passes_invisibility_gates"] else "FAIL"
+        ill_str = "PASS" if rec.get("passes_illustration_gates", True) else "FAIL"
+        bd = rec.get("proxy_vae_breakdown_jpeg75", {})
+        vae_str = f"{bd.get('sd15', 0.0):.3f}/{bd.get('sdxl', 0.0):.3f}/{bd.get('flux', 0.0):.3f}"
         lines.append(
-            f"| {rec['scale_target']} | {rec['lambda']:.2f} | {rec['beta_chroma']:.1f} | {gate_str} | "
+            f"| {rec['scale_target']} | {rec['lambda']:.2f} | {rec['beta_chroma']:.1f} | {gate_str} | {ill_str} | "
             f"{rec['mean_psnr_db']:.2f} | {rec['mean_flat_delta_e2000_p95']:.3f} | "
-            f"{rec['mean_max_abs_delta_rgb_255']:.2f} | {rec['mean_rho_lf']:.3f} | "
-            f"{rec['proxy_trp_cos_jpeg75']:.4f} | {rec['proxy_trp_cos_lpid']:.4f} | "
-            f"{rec['proxy_protection_score']:.4f} |"
+            f"{rec['mean_rho_lf']:.3f} | {rec['proxy_trp_cos_jpeg75']:.4f} | "
+            f"{rec['proxy_trp_cos_lpid']:.4f} | {vae_str} | {rec['proxy_protection_score']:.4f} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -702,8 +737,9 @@ def run_step2(
     snap_to_256_grid: bool = False,
     image_dir: Path | None = None,
     dry_run_synthetic: bool = False,
+    allow_missing_perceptual_gates: bool = False,
 ) -> dict[str, Any]:
-    """Execute Phase 0a Step 2: Direct PGD sweep across (lambda, beta_chroma, ScaleTarget)."""
+    """Execute Phase 0a Step 2: Projected Adam + EoT sweep across (lambda, beta_chroma, ScaleTarget)."""
     t0 = time.time()
     output_dir.mkdir(parents=True, exist_ok=True)
     seed = int(cfg["seed"])
@@ -717,12 +753,19 @@ def run_step2(
     if dry_run_synthetic:
         pgd_steps = min(pgd_steps, 8)
 
+    optimizer_name = str(s2_cfg.get("optimizer", "projected_adam"))
+    adam_betas = tuple(float(b) for b in s2_cfg.get("adam_betas", [0.9, 0.999]))
+    eot_always_identity = bool(s2_cfg.get("eot_always_include_identity", True))
+
     alpha_vae = float(s2_cfg.get("alpha_vae", 0.35))
     vae_weights = {k: float(v) for k, v in s2_cfg.get("vae_weights", VAE_LOSS_WEIGHTS).items()}
     lambdas = [float(v) for v in s2_cfg["lambda_values"]]
     betas = [float(v) for v in s2_cfg["beta_chroma_values"]]
     scale_targets: list[ScaleTargetType] = list(s2_cfg["scale_targets"])
     jpeg_quality = int(s2_cfg.get("eval_jpeg_quality", 75))
+    proxy_t = 2 if dry_run_synthetic else int(s2_cfg.get("proxy_eval_timesteps", 10))
+    proxy_n = 2 if dry_run_synthetic else int(s2_cfg.get("proxy_eval_noises", 2))
+    active_clip_thr = float(gates.get("active_flat_clip_threshold", 0.05))
 
     if image_dir is not None:
         images = _load_real_images(image_dir)
@@ -731,7 +774,7 @@ def run_step2(
     else:
         raise ValueError("Real Step 2 requires --image-dir pointing to the 3-domain evaluation dataset.")
 
-    # Build or reuse 9-scale target cache for ell_c*
+    # Build 9-scale target cache for ell_c*
     cache_dir = output_dir / f"target_cache_ell{ell_c_px}"
     scales = tuple(float(s) for s in tf_cfg.get("discrete_scales", DISCRETE_SCALES))
     cache = build_target_cache(
@@ -741,8 +784,9 @@ def run_step2(
         scales=scales,
         seed=seed,
         num_timesteps=4 if dry_run_synthetic else int(tf_cfg.get("rt_num_timesteps", 20)),
-        num_noises=2 if dry_run_synthetic else int(tf_cfg.get("rt_num_noises", 5)),
+        num_noises=2 if dry_run_synthetic else int(tf_cfg.get("rt_num_noises", 6)),
         batch_size=int(tf_cfg.get("rt_eval_batch_size", 8)),
+        antithetic=bool(tf_cfg.get("use_antithetic_variates", True)),
         include_extra_vaes=True,
         device="cpu",
     )
@@ -750,8 +794,8 @@ def run_step2(
     target_tensors = {k: v.to(device) for k, v in target_tensors_cpu.items()}
 
     diff_jpeg = DiffJpegSte(quality=jpeg_quality).to(device)
-    lr_start = float(s2_cfg.get("pgd_step_size_start", 0.12))
-    lr_end = float(s2_cfg.get("pgd_step_size_end", 0.02))
+    lr_start = float(s2_cfg.get("pgd_step_size_start", 0.08))
+    lr_end = float(s2_cfg.get("pgd_step_size_end", 0.015))
     all_records: list[dict[str, Any]] = []
 
     for scale_target in scale_targets:
@@ -769,14 +813,27 @@ def run_step2(
                     y_base, x_base = _pick_master_origin(h_w, w_w, rng, snap_to_256_grid=snap_to_256_grid)
 
                     hat_delta = torch.zeros((1, 3, h_w, w_w), device=device, dtype=torch.float32, requires_grad=True)
+                    opt = torch.optim.Adam([hat_delta], lr=lr_start, betas=adam_betas)
                     trp_loss_fn = EmaNormalizedTrpLoss(decay=float(s2_cfg.get("ema_trp_decay", 0.99))).to(device)
+                    use_ckpt = (device.type == "cuda") and ((h_w * w_w) > (512 * 512))
+
+                    def _compute_surrogate_branch_loss(pur: PurificationOutcome) -> torch.Tensor:
+                        r_p = surrogate.forward_trp_residual(pur.sd15_input, use_checkpoint=use_ckpt)
+                        l_trp = trp_loss_fn(r_p, pur.r_t_aligned)
+                        vae_latents: dict[str, torch.Tensor] = {
+                            "sd15": surrogate.encode_sd15_vae(pur.sd15_input, input_range="01", use_checkpoint=use_ckpt)
+                        }
+                        vae_latents.update(surrogate.encode_extra_vaes(pur.extra_vae_input, use_checkpoint=use_ckpt))
+                        l_vae, _ = multi_vae_relative_l2_loss(
+                            vae_latents, pur.vae_targets_aligned, weights=vae_weights
+                        )
+                        return l_trp + alpha_vae * l_vae
 
                     for step in range(pgd_steps):
                         progress = step / max(1, pgd_steps - 1)
                         step_lr = lr_end + 0.5 * (lr_start - lr_end) * (1.0 + math.cos(math.pi * progress))
-
-                        if hat_delta.grad is not None:
-                            hat_delta.grad.zero_()
+                        opt.param_groups[0]["lr"] = step_lr
+                        opt.zero_grad(set_to_none=True)
 
                         inj = inject_and_quantize(
                             x_orig_01=x_orig,
@@ -788,7 +845,6 @@ def run_step2(
                             ste_quantize=True,
                         )
                         x_p_nat = inj["x_out"]
-                        # Align native protected image to working grid for surrogate purification evaluation
                         if (orig_h, orig_w) == (h_w, w_w):
                             x_p_work = x_p_nat
                         elif orig_h >= h_w and orig_w >= w_w:
@@ -797,9 +853,7 @@ def run_step2(
                             x_p_work = bilinear_resize(x_p_nat, h_w, w_w)
 
                         op_name = _sample_purification_op(probs, rng)
-                        pur = apply_purification_with_targets(
-                            x_work_01=x_p_work,
-                            op_name=op_name,
+                        pur_kw = dict(
                             y_base=y_base,
                             x_base=x_base,
                             target_tensors=target_tensors,
@@ -812,28 +866,31 @@ def run_step2(
                             ),
                             bucket1024_max_scaled_pixels=int(s2_cfg.get("bucket1024_max_scaled_pixels", 1_200_000)),
                         )
+                        pur_op = apply_purification_with_targets(x_work_01=x_p_work, op_name=op_name, **pur_kw)
+                        loss_op = _compute_surrogate_branch_loss(pur_op)
 
-                        use_ckpt = device.type == "cuda"
-                        r_p = surrogate.forward_trp_residual(pur.sd15_input, use_checkpoint=use_ckpt)
-                        loss_trp = trp_loss_fn(r_p, pur.r_t_aligned)
+                        if eot_always_identity and op_name != "Identity":
+                            pur_id = apply_purification_with_targets(x_work_01=x_p_work, op_name="Identity", **pur_kw)
+                            loss_id = _compute_surrogate_branch_loss(pur_id)
+                            surr_loss = 0.5 * (loss_id + loss_op)
+                        else:
+                            surr_loss = loss_op
 
-                        vae_latents: dict[str, torch.Tensor] = {
-                            "sd15": surrogate.encode_sd15_vae(pur.sd15_input, input_range="01", use_checkpoint=use_ckpt)
-                        }
-                        vae_latents.update(surrogate.encode_extra_vaes(pur.extra_vae_input, use_checkpoint=use_ckpt))
-                        loss_vae, _ = multi_vae_relative_l2_loss(
-                            vae_latents, pur.vae_targets_aligned, weights=vae_weights
-                        )
+                        # L_chroma evaluated on fixed 512-ref grid in normalized space (§3.4.1 v0.5.3)
                         loss_chroma = flat_low_freq_chroma_loss(
-                            inj["delta_eff_norm"], masks.w_flat_native, beta_chroma=beta_chroma
+                            inj["delta_eff_norm"], masks.w_flat_ref, beta_chroma=beta_chroma
                         )
-                        total_loss = loss_trp + alpha_vae * loss_vae + loss_chroma
+                        total_loss = surr_loss + loss_chroma
                         total_loss.backward()
 
+                        if optimizer_name == "projected_adam":
+                            opt.step()
+                        else:
+                            with torch.no_grad():
+                                grad = hat_delta.grad
+                                assert grad is not None
+                                hat_delta.sub_(step_lr * grad.sign())
                         with torch.no_grad():
-                            grad = hat_delta.grad
-                            assert grad is not None
-                            hat_delta.sub_(step_lr * grad.sign())
                             hat_delta.clamp_(-1.0, 1.0)
 
                     # Final evaluation using deterministic quantized 8-bit image
@@ -852,9 +909,20 @@ def run_step2(
                             x_orig,
                             x_p_u8_01,
                             w_flat=masks.w_flat_native,
+                            m_clip_native=masks.m_clip_native,
+                            hat_delta_work=hat_delta,
+                            active_clip_threshold=active_clip_thr,
                             include_optional_perceptual=(not dry_run_synthetic),
                         )
+                        if (not dry_run_synthetic) and (not allow_missing_perceptual_gates):
+                            if qual.get("lpips") is None or qual.get("ssimulacra2") is None:
+                                raise RuntimeError(
+                                    f"Missing perceptual gate metrics in real Step 2 run "
+                                    f"(lpips={qual.get('lpips_status')}, ssimulacra2={qual.get('ssimulacra2_status')}). "
+                                    "Install optional `[eval]` dependencies or pass --allow-missing-perceptual-gates."
+                                )
 
+                        # Resize protected image to working grid for LPID and JPEG proxy evaluation
                         if (orig_h, orig_w) == (h_w, w_w):
                             x_eval_work = x_p_u8_01
                         elif orig_h >= h_w and orig_w >= w_w:
@@ -862,26 +930,65 @@ def run_step2(
                         else:
                             x_eval_work = bilinear_resize(x_p_u8_01, h_w, w_w)
 
-                        # Proxy 1: Real JPEG q=75 recompression
-                        x_jpeg = real_jpeg_recompress(x_eval_work, quality=jpeg_quality)
-                        spec_1_0 = get_scale_spec(1.00)
-                        r_t_1_0 = slice_target_latent(
-                            target_tensors["rt.s_1_00"], y_base, x_base, h_w // 8, w_w // 8, spec_1_0
-                        )
-                        r_p_jpeg = surrogate.forward_trp_residual(x_jpeg)
-                        cos_jpeg = float(
-                            F.cosine_similarity(r_p_jpeg.flatten(1), r_t_1_0.flatten(1), dim=-1).mean().item()
-                        )
-                        vaes_jpeg = {"sd15": surrogate.encode_sd15_vae(x_jpeg, input_range="01")}
-                        vaes_jpeg.update(surrogate.encode_extra_vaes(x_jpeg))
-                        targets_1_0 = {
-                            k.split(".")[1]: slice_target_latent(v, y_base, x_base, h_w // 8, w_w // 8, spec_1_0)
-                            for k, v in target_tensors.items()
-                            if k.startswith("zt.") and k.endswith(".s_1_00")
-                        }
-                        l2_jpeg_t, _ = multi_vae_relative_l2_loss(vaes_jpeg, targets_1_0, weights=vae_weights)
+                        # Proxy 1: Apply real PIL JPEG q=75 on NATIVE output first, then attacker resize
+                        x_jpeg_native = real_jpeg_recompress(x_p_u8_01, quality=jpeg_quality)
+                        if (orig_h, orig_w) == (h_w, w_w):
+                            x_jpeg_work = x_jpeg_native
+                        elif orig_h >= h_w and orig_w >= w_w:
+                            x_jpeg_work = exact_area_box_resize(x_jpeg_native, h_w, w_w)
+                        else:
+                            x_jpeg_work = bilinear_resize(x_jpeg_native, h_w, w_w)
 
-                        # Proxy 2: LPID_CropResize (valid s_eff scale & s_low=160)
+                        spec_1_0 = get_scale_spec(1.00)
+                        if scale_target == "Bucket1024":
+                            # Fair SD 1.5 0.5x downscale evaluation after native JPEG q=75
+                            jpeg_pur = apply_purification_with_targets(
+                                x_jpeg_work,
+                                op_name="Downscale05x_SD15",
+                                y_base=y_base,
+                                x_base=x_base,
+                                target_tensors=target_tensors,
+                                rng=torch.Generator(device="cpu").manual_seed(seed + 100 + img_idx),
+                            )
+                            sd15_jpeg_in = jpeg_pur.sd15_input
+                            extra_jpeg_in = jpeg_pur.extra_vae_input
+                            r_t_jpeg = jpeg_pur.r_t_aligned
+                            targets_jpeg = jpeg_pur.vae_targets_aligned
+                        else:
+                            sd15_jpeg_in = x_jpeg_work
+                            extra_jpeg_in = x_jpeg_work
+                            r_t_jpeg = slice_target_latent(
+                                target_tensors["rt.s_1_00"], y_base, x_base, h_w // 8, w_w // 8, spec_1_0
+                            )
+                            targets_jpeg = {
+                                k.split(".")[1]: slice_target_latent(v, y_base, x_base, h_w // 8, w_w // 8, spec_1_0)
+                                for k, v in target_tensors.items()
+                                if k.startswith("zt.") and k.endswith(".s_1_00")
+                            }
+
+                        r_p_jpeg = surrogate.compute_expected_rt(
+                            sd15_jpeg_in * 2.0 - 1.0,
+                            seed=seed + img_idx,
+                            num_timesteps=proxy_t,
+                            num_noises=proxy_n,
+                            antithetic=True,
+                        )
+                        cos_jpeg = float(
+                            F.cosine_similarity(r_p_jpeg.flatten(1), r_t_jpeg.flatten(1), dim=-1).mean().item()
+                        )
+                        vaes_jpeg = {"sd15": surrogate.encode_sd15_vae(sd15_jpeg_in, input_range="01")}
+                        vaes_jpeg.update(surrogate.encode_extra_vaes(extra_jpeg_in))
+                        l2_jpeg_t, bd_jpeg = multi_vae_relative_l2_loss(vaes_jpeg, targets_jpeg, weights=vae_weights)
+
+                        # Optional original SDXL VAE transfer check
+                        z_orig_sdxl = surrogate.encode_original_sdxl_vae(extra_jpeg_in)
+                        if z_orig_sdxl is not None and "sdxl" in targets_jpeg:
+                            z_t_sdxl = targets_jpeg["sdxl"].to(device=z_orig_sdxl.device, dtype=z_orig_sdxl.dtype)
+                            bd_jpeg["sdxl_original"] = float(
+                                ((z_orig_sdxl - z_t_sdxl).pow(2).sum() / (z_t_sdxl.pow(2).sum() + 1e-8)).item()
+                            )
+
+                        # Proxy 2: LPID_CropResize (valid s_eff scale & s_low=160) with seeded expected r_t
                         eval_rng = torch.Generator(device="cpu").manual_seed(seed + 777 + img_idx)
                         lpid_pur = apply_purification_with_targets(
                             x_eval_work,
@@ -892,7 +999,13 @@ def run_step2(
                             rng=eval_rng,
                             forced_low_size=160,
                         )
-                        r_p_lpid = surrogate.forward_trp_residual(lpid_pur.sd15_input)
+                        r_p_lpid = surrogate.compute_expected_rt(
+                            lpid_pur.sd15_input * 2.0 - 1.0,
+                            seed=seed + 500 + img_idx,
+                            num_timesteps=proxy_t,
+                            num_noises=proxy_n,
+                            antithetic=True,
+                        )
                         cos_lpid = float(
                             F.cosine_similarity(
                                 r_p_lpid.flatten(1), lpid_pur.r_t_aligned.flatten(1), dim=-1
@@ -900,14 +1013,17 @@ def run_step2(
                         )
                         vaes_lpid = {"sd15": surrogate.encode_sd15_vae(lpid_pur.sd15_input, input_range="01")}
                         vaes_lpid.update(surrogate.encode_extra_vaes(lpid_pur.extra_vae_input))
-                        l2_lpid_t, _ = multi_vae_relative_l2_loss(
+                        l2_lpid_t, bd_lpid = multi_vae_relative_l2_loss(
                             vaes_lpid, lpid_pur.vae_targets_aligned, weights=vae_weights
                         )
 
+                        qual["domain"] = item.get("domain", "unknown")
                         qual["proxy_trp_cos_jpeg75"] = cos_jpeg
                         qual["proxy_multi_vae_l2_jpeg75"] = float(l2_jpeg_t.item())
+                        qual["proxy_vae_breakdown_jpeg75"] = bd_jpeg
                         qual["proxy_trp_cos_lpid"] = cos_lpid
                         qual["proxy_multi_vae_l2_lpid"] = float(l2_lpid_t.item())
+                        qual["proxy_vae_breakdown_lpid"] = bd_lpid
                         per_img_metrics.append(qual)
 
                 mean_psnr = float(np.mean([m["psnr_db"] for m in per_img_metrics]))
@@ -915,10 +1031,15 @@ def run_step2(
                 mean_de_p95 = float(np.mean([m["flat_delta_e2000_p95"] for m in per_img_metrics]))
                 mean_max_rgb = float(np.mean([m["max_abs_delta_rgb_255"] for m in per_img_metrics]))
                 mean_rho_lf = float(np.mean([m["rho_lf"] for m in per_img_metrics]))
+                mean_chk = float(np.mean([m.get("work_checkerboard_f05_peak_to_median", 0.0) for m in per_img_metrics]))
                 cos_j = float(np.mean([m["proxy_trp_cos_jpeg75"] for m in per_img_metrics]))
                 cos_l = float(np.mean([m["proxy_trp_cos_lpid"] for m in per_img_metrics]))
                 l2_j = float(np.mean([m["proxy_multi_vae_l2_jpeg75"] for m in per_img_metrics]))
                 l2_l = float(np.mean([m["proxy_multi_vae_l2_lpid"] for m in per_img_metrics]))
+
+                def _avg_breakdown(key: str) -> dict[str, float]:
+                    keys = sorted({k for m in per_img_metrics for k in m.get(key, {}).keys()})
+                    return {k: float(np.mean([m[key][k] for m in per_img_metrics if k in m[key]])) for k in keys}
 
                 lpips_vals = [m["lpips"] for m in per_img_metrics if m.get("lpips") is not None]
                 ssim2_vals = [m["ssimulacra2"] for m in per_img_metrics if m.get("ssimulacra2") is not None]
@@ -933,6 +1054,17 @@ def run_step2(
                 if mean_ssim2 is not None:
                     passes_inv = passes_inv and (mean_ssim2 >= float(gates["min_ssimulacra2"]))
 
+                # Illustration domain standalone gate check (prevent dilution by Photo/Painting)
+                ill_items = [m for m in per_img_metrics if m.get("domain") == "illustration"]
+                passes_ill = True
+                if ill_items:
+                    ill_psnr = float(np.mean([m["psnr_db"] for m in ill_items]))
+                    ill_de = float(np.mean([m["flat_delta_e2000_p95"] for m in ill_items]))
+                    passes_ill = (ill_psnr >= float(gates["min_psnr_db"])) and (
+                        ill_de <= float(gates["max_flat_delta_e2000_p95"])
+                    )
+                    passes_inv = passes_inv and passes_ill
+
                 proxy_score = 0.5 * (cos_j + cos_l) - alpha_vae * 0.5 * (l2_j + l2_l)
                 all_records.append(
                     {
@@ -944,24 +1076,34 @@ def run_step2(
                         "mean_flat_delta_e2000_p95": mean_de_p95,
                         "mean_max_abs_delta_rgb_255": mean_max_rgb,
                         "mean_rho_lf": mean_rho_lf,
+                        "mean_work_checkerboard_peak_to_median": mean_chk,
                         "mean_lpips": mean_lpips,
                         "mean_ssimulacra2": mean_ssim2,
                         "proxy_trp_cos_jpeg75": cos_j,
                         "proxy_trp_cos_lpid": cos_l,
                         "proxy_multi_vae_l2_jpeg75": l2_j,
                         "proxy_multi_vae_l2_lpid": l2_l,
+                        "proxy_vae_breakdown_jpeg75": _avg_breakdown("proxy_vae_breakdown_jpeg75"),
+                        "proxy_vae_breakdown_lpid": _avg_breakdown("proxy_vae_breakdown_lpid"),
                         "proxy_protection_score": float(proxy_score),
+                        "passes_illustration_gates": bool(passes_ill),
                         "passes_invisibility_gates": bool(passes_inv),
                     }
                 )
 
     top_k = int(s2_cfg.get("top_k_pareto", 3))
     top_pareto = select_pareto_top_k(all_records, top_k=top_k)
+    top_by_scale_target = {
+        st: (select_pareto_top_k([r for r in all_records if r["scale_target"] == st], top_k=1) or [None])[0]
+        for st in scale_targets
+    }
 
     report = {
         "design_version": DESIGN_VERSION,
         "dry_run_synthetic": bool(dry_run_synthetic),
         "ell_c_px": int(ell_c_px),
+        "optimizer": optimizer_name,
+        "eot_always_include_identity": eot_always_identity,
         "snap_to_256_grid": bool(snap_to_256_grid),
         "num_images": len(images),
         "pgd_steps": pgd_steps,
@@ -970,6 +1112,7 @@ def run_step2(
         "vae_load_status": getattr(surrogate, "vae_load_status", {}),
         "all_configs": all_records,
         "top_pareto": top_pareto,
+        "top_by_scale_target": top_by_scale_target,
     }
 
     (output_dir / "step2_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -992,6 +1135,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dry-run-synthetic",
         action="store_true",
         help="Run CPU synthetic verification without downloading/executing SD 1.5 weights",
+    )
+    parser.add_argument(
+        "--allow-missing-perceptual-gates",
+        action="store_true",
+        help="Allow real Step 2 run to continue if optional LPIPS / SSIMULACRA2 packages are missing",
     )
     parser.add_argument("--device", type=str, default=None, help="Override torch device (e.g. cuda, cpu)")
     return parser.parse_args(argv)
@@ -1020,6 +1168,12 @@ def main(argv: list[str] | None = None) -> int:
             sd15_model_id=m_cfg["sd15_model_id"],
             sd15_revision=m_cfg.get("sd15_revision"),
             sdxl_vae_id=m_cfg.get("sdxl_vae_id") if need_step2 else None,
+            sdxl_original_vae_id=(
+                m_cfg.get("sdxl_original_vae_id")
+                if (need_step2 and m_cfg.get("eval_original_sdxl_vae", True))
+                else None
+            ),
+            sdxl_original_vae_subfolder=str(m_cfg.get("sdxl_original_vae_subfolder", "vae")),
             flux_vae_id=(m_cfg.get("flux_vae_id") if (need_step2 and m_cfg.get("enable_flux_vae", True)) else None),
             flux_vae_subfolder=str(m_cfg.get("flux_vae_subfolder", "vae")),
             device=device,
@@ -1065,6 +1219,7 @@ def main(argv: list[str] | None = None) -> int:
         snap_to_256_grid=snap_256,
         image_dir=args.image_dir,
         dry_run_synthetic=args.dry_run_synthetic,
+        allow_missing_perceptual_gates=args.allow_missing_perceptual_gates,
     )
     print((args.output_dir / "step2_report.md").read_text(encoding="utf-8"))
     return 0

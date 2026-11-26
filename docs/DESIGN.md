@@ -1,6 +1,6 @@
 # `holoveil` 詳細技術設計書 (Architecture & Engineering Specification)
 
-> **Version**: `0.5.2-design` (Final Locked Implementation Baseline)  
+> **Version**: `0.5.3-design` (Post-Review Hardened Implementation Baseline)  
 > **Target Runtime Stack**: Pure Rust (`candle-core` / `candle-nn` + `eframe` / `egui`)  
 > **Training Stack**: Python + PyTorch (`SafeTensors` 単一ファイル境界)  
 > **Scope**: 本書は、元論文や過去の経緯を参照せずとも **本書単体で Phase 0a/0b/0c（PoC & 早期蒸留検証）〜 Phase 3（OSS リリース）まで一気通貫で実装・検証できる完全自己完結仕様書** である。
@@ -80,7 +80,7 @@ flowchart TD
 
     subgraph S2["Stage 2: LPID + Multi-VAE + 8bit量子化STE 統合 PAR"]
         Distil -->|"Distilled Checkpoint"| Rollout["可変ステップ DDPM Rollout\nS ~ Uniform{5, 10, 25}, lambda ~ U[0.60, 1.00]\n80% 512級 + 20% 768..1216級 (832x1216含む)\n2048マスター全体からランダム原点 (y_base, x_base)"]
-        Rollout --> HatDelta["推定クリーン摂動 (YCbCr, kappa_c=0.40)\ndelta_eff = lambda * m * Pi_eta(hat_delta_0)\nX_p_cont = clamp(X_c + YCbCr2RGB(delta_eff))"]
+        Rollout --> HatDelta["推定クリーン摂動 (YCbCr, kappa_c=0.40)\ntilde_delta_eff = lambda * m * Pi_[-1,1](hat_delta_0)\nX_p_cont = clamp(X_c + YCbCr2RGB(Pi_eta(tilde_delta_eff)))"]
         HatDelta --> QuantSTE["出力画像 8-bit Blue-Noise 量子化 (STE)\n配布時の丸め＋ディザを浄化手前で常時適用"]
         QuantSTE --> Pur["バケット別 微分可能浄化プール P_holoveil\n(全エンコーダで同一 PurificationSpec 共有)\n512級: 6種 (Bucket1024Scale 含む)\n768..1216級: 6種 (Downscale05x_SD15->r_t^(0.50) 含む)"]
         Pur --> Loss["スケール統一複合報酬 L_post\n1. EMA正規化 SD1.5 TRP\n2. 逐次逆伝播 Multi-VAE (実測検証済みGradCkpt)\n3. 平坦部低周波色差損失 beta_chroma"]
@@ -101,7 +101,7 @@ flowchart LR
     Decode --> DomainEst["ドメイン決定\nユーザー指定 または ヒューリスティック自動推定\n-> domain_id in {1:Photo, 2:Painting, 3:Illustration}"]
     Decode --> NativeClip["元解像度 抗クランプマスク算出\nm_clip_native: [H, W] in [0, 1]\n(3x3 最小値フィルタで白背景線画際を保護)"]
 
-    Decode --> Planner["作業グリッド決定 (16の倍数・パディングなし)\nStandard512: 長辺512 (例: 352x512, 長尺256x1280)\nBucket1024: 面積1024^2級 (例: 832x1216)"]
+    Decode --> Planner["作業グリッド決定 (16の倍数・パディングなし)\nStandard512: 長辺512 (例: 352x512, 長尺256x1280)\nBucket1024: 面積1024^2級 (例: 832x1248 / 832x1216)"]
 
     Decode --> WorkMask["スケール不変 テクスチャマスク m_tex\n長辺512 Area Box縮小 + GuidedFilter\n-> Bilinear(align_corners=False) で [H_w, W_w]\n* min_pool_exact(m_clip_native) -> m_in"]
 
@@ -180,14 +180,14 @@ flowchart LR
   - `PixelUnshuffle(2)`: `[B, C, H, W]` $\to$ `reshape([B, C, H/2, 2, W/2, 2])` $\to$ `permute([0, 1, 3, 5, 2, 4])` $\to$ `contiguous()` $\to$ `reshape([B, C*4, H/2, W/2])`
   - `PixelShuffle(2)`: `[B, C*4, H/2, W/2]` $\to$ `reshape([B, C, 2, 2, H/2, W/2])` $\to$ `permute([0, 1, 4, 2, 5, 3])` $\to$ `contiguous()` $\to$ `reshape([B, C, H, W])`
 - **一括推論の演算量・CPU F32 ピークメモリ目標**:
-  - `Standard512` (`512×512`): `68.35 GMAC/step`、ピーク `im2col` **288 MB**、プロセス総 RSS 目標 **`< 700 MB`**。CPU 約 11 秒（25 steps）/ 4.5 秒（10 steps）、Metal 約 1.5〜3.5 秒、CUDA+cuDNN 約 0.4〜1.0 秒。
+  - `Standard512` (`512×512`): `68.35 GMAC/step`、ピーク `im2col` **288 MB**、プロセス総 RSS 目標 **`< 700 MB`**。CPU 約 18〜30 秒（25 steps）/ 7〜12 秒（10 steps）、Metal 約 1.5〜3.5 秒、CUDA+cuDNN 約 0.4〜1.0 秒。
   - `Standard512` 縦長 (`352×512`): `47.0 GMAC/step`、ピーク `im2col` **198 MB**。
   - 長尺一括 (`256×1280`): `85.4 GMAC/step`、ピーク `im2col` **360 MB**（タイル不要）。
-  - `Bucket1024` 一括 (`832×1216`): `264 GMAC/step`（`0.528 TFLOP/step`）、ピーク `im2col` **約 1.11 GB**、プロセス総 RSS 目標 **`< 2.4 GB`**。CPU 25 steps 約 44 秒 / 10 steps 約 18 秒、CUDA+cuDNN 約 1.5〜3 秒。
+  - `Bucket1024` 一括 (`832×1248` / `832×1216`): 約 `264〜271 GMAC/step`（`0.53〜0.54 TFLOP/step`）、ピーク `im2col` **約 1.11〜1.14 GB**、プロセス総 RSS 目標 **`< 2.4 GB`**（`mimalloc` 採用推奨）。CPU 25 steps 約 70〜120 秒 / 10 steps 約 28〜48 秒、CUDA+cuDNN 約 1.5〜3 秒。
 
 > [!NOTE]
 > **`PixelShuffle(2)` 由来の 2×2 格子模様（チェッカーボード）対策と監視**  
-> `PixelShuffle(2)` は学習時に 512 スケールで周期 2px（3000px 拡大時に約 12px 格子）の高調波ピークを生むリスクがある。Phase 2 の検証ループおよび Phase 3 ベンチマークでは、生成摂動の 2D FFT パワースペクトルにおける正規化周波数 $f = 0.5\text{ cycles/px}$ のエネルギー比を必ず自動監視し、ピーク発生時は `conv_out` の ICNR 初期化または微小な 2×2 隣接差分正則化を適用する。
+> `PixelShuffle(2)` は学習時に 512 スケールで周期 2px（3000px 拡大時に約 12px 格子）の高調波ピークを生むリスクがある。Phase 2 の検証ループおよび Phase 3 ベンチマークでは、非正方形リサイズによるビン移動で見逃さないよう、**作業グリッド原生解像度 $(H_w, W_w)$ 上の生成摂動 $\hat{\delta}$ の 2D FFT パワースペクトル（特に `(H_w//2, W_w//2)` 等の $f = 0.5\text{ cycles/px}$ 成分）** のエネルギー比を必ず自動監視し、ピーク発生時は `conv_out` の ICNR 初期化または微小な 2×2 隣接差分正則化を適用する。
 
 ---
 
@@ -212,14 +212,16 @@ flowchart LR
   - `Stealth` ($\lambda = 0.72$, 初期基準): $\eta_Y = 8.64/255$、**RGB 理論上限 $L_\infty = 14.76/255$**
   `QualityMetrics` および全ベンチマークでは YCbCr バジェットと **実測 `max_abs_delta_rgb_255`・RGB RMS** を必ず併記する。
 
-### 3.2 Python ↔ Rust 完全一致リサンプリング規約（Test M 対象）
+### 3.2 Python ↔ Rust 完全一致リサンプリング & 丸め規約（Test M 対象）
+
+**丸め規約の厳密統一**: Python の組み込み `round()` は最近接偶数丸め（`round(22.5) == 22`）、Rust の `f64::round()` はゼロから遠い方への丸め（`22.5_f64.round() == 23.0`）であり `.5` 境界で不一致となるため、Python・Rust 双方で **すべての座標・グリッド丸めを `floor(x + 0.5)` に統一** する。
 
 1. **縮小リサンプリング（元画像 $\to$ 512 参照画像・作業グリッド画像）**:
-   - **厳密面積平均ボックスフィルタ（Exact Weighted Area Box Filter）**: 出力画素 $o \in [0, N_{\text{out}})$ がカバーする入力連続区間 $[s_0, s_1] = [o \cdot r,\ (o + 1) \cdot r]$（$r = N_{\text{in}} / N_{\text{out}}$）に対し、入力画素 $[k, k+1]$ との重複長 $w_k = \max(0, \min(s_1, k+1) - \max(s_0, k))$ で加重平均する（水平・垂直分離実装）。Rust は `fast_image_resize::FilterType::Box`（または同一実装）、Python も同一の明示的面積平均関数を使用する（PyTorch 非アンチエイリアス `bilinear` 禁止）。
+   - **厳密面積平均ボックスフィルタ（Exact Weighted Area Box Filter）**: 出力画素 $o \in [0, N_{\text{out}})$ がカバーする入力連続区間 $[s_0, s_1] = [o \cdot r,\ (o + 1) \cdot r]$（$r = N_{\text{in}} / N_{\text{out}}$）に対し、入力画素 $[k, k+1]$ との重複長 $w_k = \max(0, \min(s_1, k+1) - \max(s_0, k))$ で加重平均する（水平・垂直分離実装）。`fast_image_resize` の Box フィルタは離散中心判定や固定小数点量子化で高コントラスト境界が乖離するため使用せず、**Python・Rust ともに `f64` 座標・重み計算 $\to$ `f32` 積和の同一分離 1D 関数を直接実装する**（PyTorch 非アンチエイリアス `bilinear` 禁止）。
 2. **マスク拡大リサンプリング（512 基準 $m_{\text{tex\_ref}} \to (H_w, W_w)$ および $(H, W)$）**:
-   - **Bilinear（`align_corners = False`）**: 画素中心座標 $u(o) = (o + 0.5)\frac{N_{\text{in}}}{N_{\text{out}}} - 0.5$（$[0, N_{\text{in}} - 1]$ クランプ）による線形補間。
+   - **Bilinear（`align_corners = False`）**: 画素中心座標 $u(o) = (o + 0.5)\frac{N_{\text{in}}}{N_{\text{out}}} - 0.5$（$[0, N_{\text{in}} - 1]$ クランプ）による分離 1D 線形補間。
 3. **摂動場 $\hat{\delta}$ の拡大リサンプリング（$(H_w, W_w) \to$ 元解像度 $(H, W)$）**:
-   - **Catmull-Rom Bicubic（$a = -0.5$、`align_corners = False`）**: 重み核 $W(x) = (a+2)|x|^3 - (a+3)|x|^2 + 1$（$|x|\le 1$）、$a|x|^3 - 5a|x|^2 + 8a|x| - 4a$（$1 < |x| < 2$）を **$a = -0.5$** で固定。Rust `fast_image_resize::FilterType::CatmullRom` と完全一致させるため、**Phase 0 を含む Python 側も PyTorch 標準 `mode="bicubic"`（$a = -0.75$）ではなく同一の $a = -0.5$ 分離 Catmull-Rom 関数を使用する**。拡大後は `[-1.0, 1.0]` へ再クランプする。
+   - **Catmull-Rom Bicubic（$a = -0.5$、`align_corners = False`）**: 重み核 $W(x) = (a+2)|x|^3 - (a+3)|x|^2 + 1$（$|x|\le 1$）、$a|x|^3 - 5a|x|^2 + 8a|x| - 4a$（$1 < |x| < 2$）を **$a = -0.5$** で固定し、Python・Rust ともに同一の分離 1D エッジ複製 4 タップ実装を使用する（PyTorch 標準 `mode="bicubic"` の $a = -0.75$ および `fast_image_resize` 依存は禁止）。拡大後は `[-1.0, 1.0]` へ再クランプする。
 
 ### 3.3 役割分離されたスケール不変知覚マスク仕様（固定 512 基準 $m_{\text{tex}}$ と 元解像度 $m_{\text{clip}}$）
 
@@ -246,10 +248,11 @@ flowchart LR
 
 ### 3.4 平坦部低周波色差損失・Blue-Noise ディザ・ICC/透過/16bit 保持
 
-1. **平坦部低周波色差ペナルティ $\mathcal{L}_{\text{chroma}}$**:
-   $$\mathcal{L}_{\text{chroma}}(\delta_{\text{eff}}) = \beta_{\text{chroma}} \cdot \frac{1}{2 H_b W_b} \sum_{c \in \{Cb, Cr\}} \left\| W_{\text{flat}} \odot \text{LP}_{\sigma=3.0}(\delta_{\text{eff}, c}) \right\|_2^2$$
+1. **平坦部低周波色差ペナルティ $\mathcal{L}_{\text{chroma}}$（固定 512 基準グリッド・バジェット正規化空間）**:
+   $$\tilde{\delta}_{\text{eff}} := \lambda \cdot m \cdot \hat{\delta} \in [-1, 1]^3, \qquad \mathcal{L}_{\text{chroma}}(\tilde{\delta}_{\text{eff}}) = \beta_{\text{chroma}} \cdot \frac{1}{2 H_{\text{ref}} W_{\text{ref}}} \sum_{c \in \{Cb, Cr\}} \left\| W_{\text{flat\_ref}} \odot \text{LP}_{\sigma=3.0}(\tilde{\delta}_{\text{eff, ref}, c}) \right\|_2^2$$
+   （$\tilde{\delta}_{\text{eff, ref}}$ は $\tilde{\delta}_{\text{eff}}$ を Exact Area Box 等で長辺 512 基準 $(H_{\text{ref}}, W_{\text{ref}})$ へ揃えたテンソル。物理スケール $\eta_{Cb} = 4.8/255$ ではなく正規化 $[-1, 1]$ 空間上で計算することで、高解像度でも周波数カットオフが一定となり、かつ $O(1)$ の $\tilde{\mathcal{L}}_{\text{TRP}}$・$\mathcal{L}_{\text{multi-vae}}$ と $\beta_{\text{chroma}} \in \{1.0, 2.0, 4.0\}$ でスケール整合する）。
 2. **8-bit 量子化加算時の ±0.5 LSB Blue-Noise ディザリング**:
-   - $64 \times 64$ Void-and-Cluster Blue-Noise 行列 $B \in [0, 1)^{64 \times 64}$ を静的埋め込みし、$d(y, x) = B[y \bmod 64, x \bmod 64] - 0.5 \in [-0.5, 0.5)$。
+   - $64 \times 64$ Void-and-Cluster Blue-Noise 行列の完全置換 `0..4095` を `u16` リトルエンディアン **`8,192 bytes` (`assets/blue_noise_64x64_u16le.bin`)** として共有埋め込みし、$B = \text{u16}/4096.0 \in [0, 1)^{64 \times 64}$、$d(y, x) = B[y \bmod 64, x \bmod 64] - 0.5 \in [-0.5, 0.5)$ を用いる。
    - **厳格無変更ガード（論理和 OR）**: **`alpha(y, x) == 0` または `m_clip_native(y, x) == 0.0` または $|\,255 \cdot \Delta_{\text{RGB}}(y, x, c)\,| < 10^{-3}$** の画素は摂動・ディザを一切適用せず元画素をビット保持する。
    - アクティブ画素：$X_p^{(u8)} = \text{clamp}_{[0, 255]}(\lfloor X_{\text{orig}} + 255.0 \cdot \Delta_{\text{RGB}} + d(y, x) + 0.5 \rfloor)$。
    - 16-bit PNG 入力 $\to$ PNG 出力時は `u16`（スケール `65535.0`、ディザなし）で階調維持。
@@ -259,9 +262,9 @@ flowchart LR
 
 ### 3.5 任意解像度一括推論と OOM フォールバック（MultiDiffusion）
 
-1. **作業グリッド $(H_w, W_w)$ の決定（16 の倍数・パディングなし）**:
-   - **`Standard512`**: 長辺 `512` 基準。もし短辺 $< 256$ の極端な長尺画像（例: $600 \times 3000$）なら短辺を $\min(512, \max(256, \text{short\_orig}))$ へ引き上げ 16 の倍数へ丸める（例: `256×1280`）。
-   - **`Bucket1024`**: 面積 $H_w \cdot W_w \approx 1024^2$ となる 16 の倍数（例: $2000 \times 3000 \to 832 \times 1216$）。**SDXL / Flux 等の 1024 級学習モデルへの保護を想定する場合は `Bucket1024` の使用を推奨**（`Standard512` でも `s = 2.25, 2.50` までの拡大耐性を学習するが、作業解像度が高い `Bucket1024` の方が高解像度モデルに対して有利である旨を UI ヘルプおよび README へ明記する）。
+1. **作業グリッド $(H_w, W_w)$ の決定（16 の倍数・パディングなし・`floor(x+0.5)` 丸め統一）**:
+   - **`Standard512`**: 長辺 `512` 基準で `short_w = round_mult16(512 * short_orig / long_orig)` とする。もし `short_w < 256` となる極端な長尺画像（例: `600 × 3000`）では、`short_w = min(256, max(64, round_mult16(short_orig)))`（`short_orig >= 256` なら `256`）へ設定し、長辺をアスペクト比通り `long_w = round_mult16(short_w * long_orig / short_orig)` へ丸める（例: `600 × 3000 -> 256 × 1280`）。
+   - **`Bucket1024`**: 等面積スケール `scale = 1024 / sqrt(H * W)` による 16 の倍数丸め（例: `2000 × 3000 -> 832 × 1248`。`kohya_ss` 等が `2000×3000` を `832×1248` に縮小後、上下中央クロップで `832×1216` を作る場合も中央アンカー潜在座標 `[2:154]` が 1 サブピクセルのズレなく整合する）。**SDXL / Flux 等の 1024 級学習モデルへの保護を想定する場合は `Bucket1024` の使用を推奨**（`Standard512` でも `s = 2.25, 2.50` までの拡大耐性を学習するが、作業解像度が高い `Bucket1024` の方が高解像度モデルに対して有利である旨を UI ヘルプおよび README へ明記する）。
 2. **一括推論（通常経路）**: $H_w \cdot W_w \le \text{max\_direct\_pixels}$（既定 `1_150_000` px）を満たす全画像（`Standard512`・`Bucket1024`・長尺）を 1 回の一括 DDPM サンプリング（`Q_chunk=256`）で処理する。ターゲット残差は単位分散正規化済み `cond.target_residual_master`（`[1, 4, 256, 256]`）の中央アンカーから `[1, 4, H_w/8, W_w/8]` を直接切り抜いて与える（スケール `1.0`）。
 3. **OOM フォールバック（MultiDiffusion）**: $H_w \cdot W_w > \text{max\_direct\_pixels}$ の場合のみ `512×512`（ストライド `256`）タイルへ切替え、大域ノイズ場 $\delta_T^{\text{global}}, \epsilon_{z,i}^{\text{global}}$ および `cond.target_residual_master` の大域座標スライスを共有して毎 DDPM ステップで重複領域を加重平均する。
 
@@ -279,11 +282,11 @@ holoveil/
 ├── MODEL_LICENSE                      # モデル重み用ライセンス (法務確認後確定・コードと分離)
 ├── README.md                          # 保護限界・RGB L∞換算・ライセンス構成の誠実な開示
 ├── docs/
-│   ├── DESIGN.md                      # 本技術設計書 v0.5.2 (Final Locked Baseline)
+│   ├── DESIGN.md                      # 本技術設計書 v0.5.3 (Post-Review Hardened Baseline)
 │   ├── POC_REPORT.md                  # Phase 0a/0b/0c 統計検証 & 早期蒸留アブレーションレポート
 │   └── BENCHMARK.md                   # Phase 3 画質・耐性ベンチマーク結果
 ├── assets/
-│   ├── blue_noise_64x64.bin           # 4KB 静的埋め込み用 (include_bytes!) Blue-noise テーブル
+│   ├── blue_noise_64x64_u16le.bin     # 8KB (8,192B) 静的埋め込み用 (include_bytes!) u16 LE Blue-noise テーブル
 │   └── fixtures/                      # CI テスト画像 & CPU生成 golden_test.safetensors
 ├── crates/
 │   ├── holoveil-core/
@@ -304,7 +307,7 @@ holoveil/
 │   │       ├── image_ops/
 │   │       │   ├── mod.rs
 │   │       │   ├── io.rs              # EXIF補正, ICCプロファイル(iCCP)保持, 8/16bit & RGBA 分離結合
-│   │       │   ├── resample.rs        # Exact Area Box縮小 / Bilinear(align_corners=False) / Catmull-Rom(a=-0.5)
+│   │       │   ├── resample.rs        # Pure Rust + Rayon 分離 Exact Area Box / Bilinear / Catmull-Rom(a=-0.5)
 │   │       │   ├── mask.rs            # 固定512基準 GuidedFilter m_tex + 元解像度 m_clip_native + 厳密 MinPool
 │   │       │   ├── inject.rs          # 残差インジェクション + +/-0.5 LSB Blue-Noise ディザ (OR安全ガード)
 │   │       │   └── jpeg_sim.rs        # GUI 用インメモリ JPEG q75 再圧縮シミュレーション
@@ -362,8 +365,8 @@ Phase 1 初期化時に `cargo add` で **crates.io の実在する最新安定�
 | 対象クレート | 必須クレートと主要 Feature (`cargo add` 指針) | 役割と選定理由 |
 | :--- | :--- | :--- |
 | `holoveil-core` | `candle-core`, `candle-nn`, `safetensors` | Pure Rust 推論・`mmap` 読込。オプション feature: `metal`, `cuda`（**必ず `candle-core/cudnn` 同時有効化**）, `accelerate`。 |
-| `holoveil-core` | `image` (`--no-default-features -F png,jpeg,webp,bmp,tiff`), `fast_image_resize` (`-F image`), `png`, `kamadak-exif` | Pure Rust 画像デコード/エンコード、SIMD リサイズ（Box / Bilinear / Catmull-Rom）、EXIF 補正、ICC 保持。 |
-| `holoveil-core` | `rayon`, `rand`, `rand_chacha`, `rand_distr`, `serde` (`-F derive`), `serde_json`, `thiserror`, `tracing` | 並列計算、決定論ノイズ、設定直列化、エラー処理。 |
+| `holoveil-core` | `image` (`--no-default-features -F png,jpeg,webp,bmp,tiff`), `png`, `kamadak-exif` | Pure Rust 画像デコード/エンコード、EXIF 補正、ICC 保持（リサイズは Python 完全一致の分離 1D `AreaBox`/`Bilinear`/`CatmullRom` を `rayon` で直接実装、`fast_image_resize` 不使用）。 |
+| `holoveil-core` | `rayon`, `rand`, `rand_chacha`, `rand_distr`, `serde` (`-F derive`), `serde_json`, `thiserror`, `tracing` | 並列計算、決定論ノイズ、設定直列化、エラー処理（`holoveil-cli`/`holoveil-gui` バイナリでは CPU `im2col` 断片化抑制のため `mimalloc` グローバルアロケータ採用を推奨）。 |
 | `holoveil-cli` | `holoveil-core`, `clap` (`-F derive`), `indicatif`, `tracing-subscriber` (`-F env-filter`) | 先行検証・バッチ処理・パリティ・ICC・メモリ計測。 |
 | `holoveil-gui` | `holoveil-core`, `eframe`, `egui`, `egui_extras` (`-F image`), `rfd`, `crossbeam-channel` | Pure Rust デスクトップ GUI（非同期ランタイム `tokio` 不使用）。 |
 
@@ -469,9 +472,9 @@ impl HoloveilEngine {
 #### Sinusoidal Embedding & DDPM 数式規約（PyTorch ↔ Candle 完全一致）
 1. **Sinusoidal Embedding (`dim = 64` 時刻 / `dim = 32` 強度 $\lambda$)**:
    `half = dim / 2`、$\omega_k = \exp(-\ln(10000) \cdot k / \text{half})$（`f32`）、$a_k = x \cdot \omega_k$（時刻 $x = t$、強度 $x = 1000.0\cdot\lambda$）に対し **前半 $\cos(a_k)$・後半 $\sin(a_k)$** を連結。
-2. **Cosine 1000-step スケジュール（`f64` 事前計算・`trailing` ステップ列）**:
+2. **Cosine 1000-step スケジュール（`f64` 事前計算・`trailing` 整数ステップ列）**:
    $$f(t) = \cos^2\!\left(\frac{t/1000 + 0.008}{1.008} \cdot \frac{\pi}{2}\right), \quad \beta_t = \text{clamp}_{[10^{-4}, 0.999]}\!\left(1 - \frac{f(t+1)}{f(t)}\right), \quad \bar{\alpha}_t = \prod_{j=0}^{t} (1 - \beta_j)$$
-   $$t_i = \left\lfloor (S - 1 - i) \cdot \frac{1000}{S} \right\rfloor + \left\lfloor \frac{1000}{S} \right\rfloor - 1 \quad (i = 0, \dots, S-1)$$
+   $$t_i = 1000 - 1 - \left\lfloor \frac{i \cdot 1000}{S} \right\rfloor \quad (i = 0, \dots, S-1, \text{ 常に } t_0 = 999),\qquad t_{\text{prev}} := t_{i+1}\ (i < S-1)$$
 3. **v-prediction 逆拡散更新（内部 `F32` 強制・`clamp` 位置厳守）**:
    - $\hat{\delta}_0 = \text{clamp}_{[-1, 1]}\!\big(\sqrt{\bar{\alpha}_t}\,\delta_t - \sqrt{1 - \bar{\alpha}_t}\,v_\theta\big)$（必ず $\tilde{\mu}_t$ 算出前にクランプ）。
    - $\alpha_{\text{eff}} = \bar{\alpha}_t / \bar{\alpha}_{t_{\text{prev}}},\ \beta_{\text{eff}} = 1 - \alpha_{\text{eff}},\ \tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t_{\text{prev}}}}{1 - \bar{\alpha}_t}\beta_{\text{eff}}$。
@@ -495,7 +498,7 @@ impl HoloveilEngine {
 1. **余白付き定常場 $X_t^{\text{raw}} \in [-1, 1]^{3 \times 2560 \times 2560}$ と境界無欠損 $r_t^{(1.0)}$ 構築**:
    - 全ステージおよび推論の共通論理座標系を **`[0, 2048) × [0, 2048)`** で統一する。
    - 窓つなぎ合わせ時に各 `512×512` 窓の外周 8 潜在画素（64px）を破棄した際に、マスター外周 64px 帯が未定義・境界汚染となる問題を防ぐため、2D 白色雑音へのガウシアン平滑場（$1/e$ 相関長 $\ell_c = 2\,\sigma_{\text{corr}}$）は **全周 `256px` の定常余白を含む $X_t^{\text{raw}} \in [-1, 1]^{3 \times 2560 \times 2560}$** として生成する（中央 `[256:2304, 256:2304]` が論理 `2048×2048` マスター $X_t^{\text{master}}$）。
-   - Phase 0a では **$\ell_c \in \{48, 96, 160\}\text{ px}$（$\sigma_{\text{corr}} \in \{24, 48, 80\}\text{ px}$）** の 3 候補について、余白付き評価キャンバス $X_t^{\text{eval}(1.0)} = X_t^{\text{raw}}[:, :, 128:2432, 128:2432]$（`2304 × 2304 = 2048 + 2×128`）に対し、凍結 SD 1.5（`stable-diffusion-v1-5/stable-diffusion-v1-5` リビジョン固定、空プロンプト、20 タイムステップ × 5 ノイズ平均）の 50% 重複 `512×512` 窓（`8×8 = 64` 窓、ストライド `256`、外周 8 潜在画素破棄コサイン合成）で評価後、中央の `[16:272, 16:272]` を切り出して **外周 0..255 まで全画素が各窓の内側 $\ge 64\text{px}$ に収まる境界無欠損 $r_t^{(1.0)} \in \mathbb{R}^{1 \times 4 \times 256 \times 256}$** を構築し、以下の 2 つを最優先実測する：
+   - Phase 0a では **$\ell_c \in \{48, 96, 160\}\text{ px}$（$\sigma_{\text{corr}} \in \{24, 48, 80\}\text{ px}$）** の 3 候補について、余白付き評価キャンバス $X_t^{\text{eval}(1.0)} = X_t^{\text{raw}}[:, :, 128:2432, 128:2432]$（`2304 × 2304 = 2048 + 2×128`）に対し、凍結 SD 1.5（`stable-diffusion-v1-5/stable-diffusion-v1-5` リビジョン SHA 固定ログ、空プロンプト、**20 タイムステップ × 対偶変量 `(+eps, -eps)` 6 ノイズ平均**）の 50% 重複 `512×512` 窓（`8×8 = 64` 窓、ストライド `256`、外周 8 潜在画素破棄・評価キャンバス外側辺のみフラット `1.0` のコサイン合成）で評価後、中央の `[16:272, 16:272]` を切り出して **外周 0..255 まで全画素が各窓の内側 $\ge 64\text{px}$ に収まる境界無欠損 $r_t^{(1.0)} \in \mathbb{R}^{1 \times 4 \times 256 \times 256}$** を構築し、以下の 2 つを最優先実測する（`verify_rt_stitch_fidelity` では大域 `320×320` 潜在ノイズ場を 64 窓評価と 20 箇所直接評価で共有し、モンテカルロ誤差を除去する）：
      - **(a) 窓つなぎ合わせ近似誤差ゲート（`verify_rt_stitch_fidelity`）**: ランダムな 20 箇所の原点 $(y_i, x_i) \in [0, 1536]^2$（8 の倍数）について「その位置の `512×512` 画像を直接 SD 1.5 に通した真の $r_t$」と「境界無欠損 $r_t^{(1.0)}$ からの `[64×64]` スライス」のコサイン類似度を計測し、**平均 $\ge 0.90$** を要求する。もし `< 0.90` となった場合のフォールバック規約：**報酬評価用の原点 $(y_{\text{base}}, x_{\text{base}})$ を窓格子（256px 刻み）に揃え、U-Net の `cond_proj` 入力のみ任意原点（または格子整合原点）とする**。
      - **(b) $r_t$ 空間自己相関 $\rho_{r_t}(\Delta)$**: $\Delta \in \{0, 8, 16, 32, 48, 64\}\text{ px}$ で実測。**$\rho_{r_t}(32\text{px}) \ge 0.50$** を満たす候補の中から、**相関長が最も短い候補 $\ell_c^*$** を Phase 0a の $\lambda, \beta$ スイープ初期基準に選ぶ（ブロブ化による阻害力低下を防ぐため）。
 2. **9 段階離散スケールキャッシュ $\mathcal{S} = \{0.50, 1.00, 1.15, 1.30, 1.50, 1.75, 2.00, 2.25, 2.50\}$ と実効倍率 $s_{\text{eff}}$ 規約**:
@@ -511,11 +514,11 @@ impl HoloveilEngine {
      - `2.50`: $L_s = 5120,\ s_{\text{eff}} = 2.500000$（評価 `5376²`, `20×20=400` 窓, `6.25 MiB`）
    - **位相ズレゼロの余白付き評価手順（全 9 スケール共通）**:
      1. `2560×2560` の $X_t^{\text{raw}}$ を **$L_{\text{total}, s} = 5 L_s / 4$**（`s = 0.50` は Exact Area Box、`s > 1.00` は Bilinear `align_corners=False`）へリサイズする。$L_s$ が 64 の倍数のため片側余白 $\text{pad}_s = L_s / 8 \ge 128$ は常に厳密整数であり、倍率 $L_{\text{total}, s} / 2560 \equiv L_s / 2048 = s_{\text{eff}}$ となって論理コア `[256:2304]` と 1 サブピクセルのズレも生じない。
-     2. 整数スライス $[\text{pad}_s - 128 : \text{pad}_s + L_s + 128]$ で評価キャンバス $(L_s + 256) \times (L_s + 256)$ を取得し、`512×512` 重複窓（ストライド `256`、端数時は終端揃え窓 `L_eval - 512` を追加、全窓で外周 8 潜在画素破棄コサイン合成）で SD 1.5 残差および Multi-VAE 潜在を計算する。
+     2. 整数スライス $[\text{pad}_s - 128 : \text{pad}_s + L_s + 128]$ で評価キャンバス $(L_s + 256) \times (L_s + 256)$ を取得し、`512×512` 重複窓（ストライド `256`、端数時は終端揃え窓 `L_eval - 512` を追加、全窓で外周 8 潜在画素破棄・評価キャンバス最外縁のみフラット `1.0` のコサイン合成により全スケール `core_min_weight_sum >= 1.0` を保証）で SD 1.5 残差および Multi-VAE 潜在を計算する。
      3. 評価後に中央の潜在領域 `[16 : 16 + L_s/8, 16 : 16 + L_s/8]` を切り出して $r_t^{(s)} \in \mathbb{R}^{1 \times 4 \times (L_s/8) \times (L_s/8)}$ および $z_{t,k}^{(s)}$ を確定する（全 9 スケール合計 `1,621` 窓・$r_t$ 計 `24.93 MiB`・3 VAE 込み計約 `175 MiB`、A100 で数十分の 1 回限り計算）。
    - `s = 1.00` から `rt_norm_mean = mean(r_t^(1.0))`、`rt_norm_std = std(r_t^(1.0))` を算出し、単位分散正規化版 $\tilde{r}_t^{\text{master}} = (r_t^{(1.0)} - \mu_{r_t}) / (\sigma_{r_t} + 10^{-8})$ を U-Net の `cond_proj` 入力および `SafeTensors` バンドルに使用する（報酬の TRP 内積自体は元の $r_t^{(s)}$ 方向を使用）。
-3. **バケットサイズ別 浄化オペレータと空間ターゲット厳密対応表（全計算に $s_{\text{eff}}$ を使用）**:
-   学習サンプルのバケット寸法 $(H_b, W_b)$ に対し、境界無欠損となった **マスター全体 `[0, 2048 - H_b] × [0, 2048 - W_b]`** から 8 の倍数のランダム原点 $(y_{\text{base}}, x_{\text{base}})$ を選び、U-Net の `cond_proj` へ $\tilde{r}_t^{\text{master}}[:, :, y_{\text{base}}/8 : (y_{\text{base}}+H_b)/8,\ x_{\text{base}}/8 : (x_{\text{base}}+W_b)/8]$ を入力する（拡大系スライス開始位置は丸め端数ガードとして `clamp(round(s_eff * coord / 8), 0, L_s/8 - patch_lat)` を適用）。
+3. **バケットサイズ別 浄化オペレータと空間ターゲット厳密対応表（全計算に $s_{\text{eff}}$ と `floor(x + 0.5)` を使用）**:
+   学習サンプルのバケット寸法 $(H_b, W_b)$ に対し、境界無欠損となった **マスター全体 `[0, 2048 - H_b] × [0, 2048 - W_b]`** から 8 の倍数のランダム原点 $(y_{\text{base}}, x_{\text{base}})$ を選び、U-Net の `cond_proj` へ $\tilde{r}_t^{\text{master}}[:, :, y_{\text{base}}/8 : (y_{\text{base}}+H_b)/8,\ x_{\text{base}}/8 : (x_{\text{base}}+W_b)/8]$ を入力する（拡大系スライス開始位置は丸め端数ガードとして `clamp(floor(s_eff * coord / 8 + 0.5), 0, L_s/8 - patch_lat)` を適用）。
 
 | バケット区分 | 浄化オペレータ（確率） | 保護画像への処理（共有 `PurificationSpec`） | 報酬評価に使用する厳密ターゲットスライス |
 | :--- | :--- | :--- | :--- |
@@ -528,18 +531,18 @@ impl HoloveilEngine {
 
 4. **損失スケール統一**:
    $$\mathcal{L}_{\text{multi-vae}} = \sum_{k \in \{\text{SD15, SDXL, Flux}\}} w_k \cdot \frac{\|\mathcal{E}_k(\tilde{X}_p) - z_{t, k}^{\text{aligned}}\|_2^2}{\|z_{t, k}^{\text{aligned}}\|_2^2 + 10^{-8}}$$
-   $$\mathcal{L}_{\text{total}} = \tilde{\mathcal{L}}_{\text{TRP}}(\tilde{X}_p, r_t^{\text{aligned}}) + \alpha_{\text{vae}}\,\mathcal{L}_{\text{multi-vae}} + \beta_{\text{chroma}}\,\mathcal{L}_{\text{chroma}}(\delta_{\text{eff}})$$
-   （$w_{\text{SD15}} = 0.2,\ w_{\text{SDXL}} = 0.5,\ w_{\text{Flux}} = 0.5$。$\alpha_{\text{vae}}$ は Phase 0b の SDXL 実 LoRA スイープで確定する）。
+   $$\mathcal{L}_{\text{total}} = \tilde{\mathcal{L}}_{\text{TRP}}(\tilde{X}_p, r_t^{\text{aligned}}) + \alpha_{\text{vae}}\,\mathcal{L}_{\text{multi-vae}} + \beta_{\text{chroma}}\,\mathcal{L}_{\text{chroma}}(\tilde{\delta}_{\text{eff}})$$
+   （$w_{\text{SD15}} = 0.2,\ w_{\text{SDXL}} = 0.5,\ w_{\text{Flux}} = 0.5$。ただし Flux 16ch VAE の準可逆性により Phase 0a Step 2/0b で寄与薄または SD 1.5/SDXL 阻害が判明した場合は $w_{\text{Flux}} \in [0.15, 0.25]$ へ調整し、$\alpha_{\text{vae}}$ は Phase 0b の SDXL 実 LoRA スイープで確定する）。
 
 ### 5.3 Stage 1a / Stage 1b / Stage 2 学習レシピ
 
 1. **Stage 1a: 高速ミニバッチ教師 PGD (`gen_teacher.py`)**:
-   - **2048 マスター全体**から各画像にランダム原点 $(y_{\text{base}}, x_{\text{base}})$ を割り当て、**SD 1.5 EMA 正規化 TRP ＋ $\mathcal{L}_{\text{chroma}}$ のみ**（Multi-VAE は Stage 2 へ集中し A100 約 12〜25 時間へ抑制）で YCbCr（$\eta_Y = 12/255, \kappa_c = 0.40$）・知覚マスク $\delta_{\text{eff}} = m \odot \delta$ のミニバッチ並列 PGD（`B = 8`, `bf16` + `channels_last` + `torch.compile()`, T4 FP16 時は `GradScaler` 必須, $N \sim \mathcal{U}\{50, \dots, 120\}$, コサイン減衰, Early Stop）を実行。500 枚ごとの `uint8` `.npz` シャード（`y_base, x_base` 含む）をローカル SSD へ出力。
+   - **2048 マスター全体**から各画像にランダム原点 $(y_{\text{base}}, x_{\text{base}})$ を割り当て、**SD 1.5 EMA 正規化 TRP ＋ 512 基準正規化空間 $\mathcal{L}_{\text{chroma}}$ のみ**（Multi-VAE は Stage 2 へ集中し A100 約 12〜25 時間へ抑制）で YCbCr（$\eta_Y = 12/255, \kappa_c = 0.40$）・知覚マスク $\tilde{\delta}_{\text{eff}} = m \odot \hat{\delta}$ のミニバッチ並列 Projected Adam / MI-FGSM（`B = 8`, `bf16` + `channels_last` + `torch.compile()`, T4 FP16 時は `GradScaler` 必須, $N \sim \mathcal{U}\{50, \dots, 120\}$, Early Stop）を実行。500 枚ごとの `uint8` `.npz` シャード（`y_base, x_base` 含む）をローカル SSD へ出力。
 2. **Stage 1b: 16 倍数マルチアスペクト蒸留 (`train_distill.py`)**:
    - 512 級マルチアスペクトバケット、`lambda = 1.0`、20% ランダム矩形 ROI、各教師の `(y_base, x_base)` に一致する単位分散正規化 $\tilde{r}_t^{\text{master}}$ スライスを `cond_proj` へ入力。AdamW (`lr=1e-4`, Cosine Annealing, 実質 batch 8, 100 ep, EMA `0.9999`)。A100 約 2〜4 時間。
 3. **Stage 2: 学習・推論完全整合 PAR (`train_par.py`)**:
-   - **バケット配分**: 80% 512 級バケット（実質 batch 4）＋ **20% 768〜1216 級バケット**（`768×768`, `640×896`, `896×640`, `768×1024`, `1024×768`, **`832×1216`, `1216×832`**, micro-batch 1 × grad accum 4）。各イテレーションで **2048 マスター全体**からランダム原点 $(y_{\text{base}}, x_{\text{base}})$ の $\tilde{r}_t^{\text{master}}$ スライスを `cond_proj` へ入力。
-   - **強度・ロールアウト・出力 8-bit 量子化 STE**: $\lambda \sim \mathcal{U}[0.60, 1.00]$ を `lambda_mlp` へ条件入力し、可変ロールアウト $S_{\text{roll}} \sim \text{Uniform}\{5, 10, 25\}$（先頭 30% スキップ、$K = 2$ / $S=5$ 時は $K=1$）、浄化直前に **出力画像 8-bit Blue-Noise 量子化 STE** を常時適用。
+   - **バケット配分**: 80% 512 級バケット（実質 batch 4）＋ **20% 768〜1216 級バケット**（`768×768`, `640×896`, `896×640`, `768×1024`, `1024×768`, **`832×1248`, `1248×832`, `832×1216`, `1216×832`**, micro-batch 1 × grad accum 4）。各イテレーションで **2048 マスター全体**からランダム原点 $(y_{\text{base}}, x_{\text{base}})$ の $\tilde{r}_t^{\text{master}}$ スライスを `cond_proj` へ入力。
+   - **強度・ロールアウト（先頭 30% スキップ廃止）・出力 8-bit 量子化 STE**: $\lambda \sim \mathcal{U}[0.60, 1.00]$ を `lambda_mlp` へ条件入力し、可変ロールアウト $S_{\text{roll}} \sim \text{Uniform}\{5, 10, 25\}$ において、**`S in {5, 10}` は全ステップ Checkpointed BPTT、`S = 25` は高ノイズ域（$t \ge 500$）を必ず 1 ステップ以上含む全域サンプリング（$K=3$ ステップまたは 3 ステップ毎チェックポイント BPTT）** を実施し、低周波形成期・$\lambda$・Multi-VAE の勾配到達を保証する。浄化直前に **出力画像 8-bit Blue-Noise 量子化 STE** を常時適用。
    - **凍結モデル勾配チェックポイント有効化 & 逐次逆伝播**:
      - 全凍結サロゲートモデルは `requires_grad_(False)` としたうえで、`.train()`（dropout=0・BatchNorm なし確認済み）または明示的 `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)` でラップする。
      - **起動時 VRAM 実測アサート**: 学習開始前にダミー `1024×1024` 入力でチェックポイント OFF / ON の `torch.cuda.max_memory_allocated()` を比較アサートする。
@@ -549,13 +552,15 @@ impl HoloveilEngine {
 ### 5.4 `SafeTensors` 出力と厳密な PyTorch ↔ Candle パリティ検証仕様
 
 - **`holoveil_v1.safetensors`**（約 42.8 MB = UNet FP16 41.76 MB + 単位分散正規化済み `cond.target_residual_master` F32 1.00 MiB）:
-  - `__metadata__`: `format_version="5.2"`, `model_arch="holoveil-unet-20m-v5"`, `color_space="ycbcr_bt601_full"`, `base_eta_y_255="12.0"`, `fixed_chroma_ratio="0.40"`, `schedule="cosine:1000:v_prediction:trailing"`, `rt_master_key="cond.target_residual_master"`, `rt_norm_mean="<実測f64>"`, `rt_norm_std="<実測f64>"`, `weight_license="<法務確認後の確定値>"`（学習用 9 段階スケールキャッシュ側にも各スケールの `(s_nominal, L_s, s_eff)` を `target_cache_manifest.json` / `__metadata__` へ記録）。
+  - `__metadata__`: `format_version="5.3"`, `model_arch="holoveil-unet-20m-v5"`, `color_space="ycbcr_bt601_full"`, `base_eta_y_255="12.0"`, `fixed_chroma_ratio="0.40"`, `schedule="cosine:1000:v_prediction:trailing"`, `rt_master_key="cond.target_residual_master"`, `rt_norm_mean="<実測f64>"`, `rt_norm_std="<実測f64>"`, `weight_license="<法務確認後の確定値>"`（学習用 9 段階スケールキャッシュ側にも各スケールの `(s_nominal, L_s, s_eff)` を `target_cache_manifest.json` / `__metadata__` へ記録）。
 - **CPU 生成 Golden パリティ検証 (`export_safetensors.py` + `holoveil-cli verify-parity`)**:
-  - `golden_test.safetensors` は必ず **PyTorch CPU (`device="cpu"`, `F32`, `allow_tf32=False`)** 上で生成する（CUDA 決定論検証時のみ `CUBLAS_WORKSPACE_CONFIG=:4096:8` 明示）。
-  1. **Test M（リサンプリング・知覚マスク・非整数 `MinPool` パリティ）**: 非整数縮小比画像（`773 × 1159` $\to$ `352 × 512`）に対し、Area Box 縮小、Guided Filter `m_tex`、`m_clip_native`、`min_pool_exact(m_clip_native)`、Catmull-Rom (`a = -0.5`) 拡大の最大絶対誤差 $< 10^{-5}$。
+  - `golden_test.safetensors` は必ず **PyTorch CPU (`device="cpu"`, `F32`, `allow_tf32=False`)** 上で生成する（F16 パリティ比較時は一度 FP16 丸め→FP32 復元した重みも検証対象とする。CUDA 決定論検証時のみ `CUBLAS_WORKSPACE_CONFIG=:4096:8` 明示）。
+  1. **Test M（リサンプリング・知覚マスク・非整数 `MinPool` パリティ）**: 非整数縮小比画像（`773 × 1159` $\to$ `352 × 512`）に対し、Pure Rust 分離 `AreaBox` 縮小、Guided Filter `m_tex`、`m_clip_native`、`min_pool_exact(m_clip_native)`、分離 `Catmull-Rom(a = -0.5)` 拡大の最大絶対誤差 $< 10^{-5}$。
   2. **Test A（単一 Forward パリティ — 長方形 `352×512`）**: 固定入力 `(x_clean, delta_s, mask_in, r_t_norm_crop, t=500, domain_id=3, lambda=0.72)` に対し、**F32** 相対 L2 誤差 $< 10^{-4}$ かつ コサイン類似度 $> 0.999999$、**F16（Metal / CUDA）** 相対 L2 誤差 $< 5 \times 10^{-3}$ かつ コサイン類似度 $> 0.9995$。
   3. **Test B（外部ノイズ注入 5-Step DDPM ループ全体パリティ）**: `init_noise` と `step_noise.{0..3}` 外部注入で、最終 $\hat{\delta}_0$ 相対 L2 誤差 $< 5 \times 10^{-4}$（F32）/ $< 1.5 \times 10^{-2}$（F16）、コサイン類似度 $> 0.99999$（F32）/ $> 0.999$（F16）。
-  4. **Test C（エンドツーエンド `u8` 出力許容）**: **CPU 間・GPU 間ともに最大絶対差 $\le 1$ LSB（かつ 99.5% 以上の画素が完全一致）**。
+  4. **Test C（エンドツーエンド `u8` 出力許容 — 精度別分離基準）**:
+     - **CPU F32 間**: 最大絶対差 $\le 1$ LSB かつ **99.5% 以上の画素が完全一致**。
+     - **GPU F16 vs CPU F32**: 一様 Blue-Noise ディザ下では F16 微小誤差による 1 LSB 境界跨ぎが確率的に発生するため、**99.5% 以上の画素が差 $\le 1$ LSB（最大絶対差 $\le 2$ LSB、平均絶対差 $< 0.15$ LSB）** とする。
 
 ---
 
@@ -565,7 +570,7 @@ Phase 1 は以下の **コア導線** を最優先で完成させ、`FeatheredRo
 
 ```text
 +----------------------------------------------------------------------------------------+
-| [holoveil v0.5.2] Model: holoveil_v1.safetensors (Metal/F16) [+ Add] [Export All] [?]  |
+| [holoveil v0.5.3] Model: holoveil_v1.safetensors (Metal/F16) [+ Add] [Export All] [?]  |
 +------------------------+---------------------------------------------------------------+
 |  PROTECTION SETTINGS   | [Split Compare] [Diff x15] [JPEG q75 Preview]    Zoom: 100%   |
 |  (*) Stealth (推奨)    +---------------------------------------------------------------+
@@ -609,14 +614,14 @@ Phase 1 は以下の **コア導線** を最優先で完成させ、`FeatheredRo
 
 #### Phase 0a: ターゲット検証 & パレートスクリーニング（LoRA なし・A100/L4 約 2〜4 時間）
 `trainer/holoveil_train/poc_screen.py` で以下を順番に実行する：
-1. **Step 1（ターゲット品質＆窓近似検証 — 最優先の 2 大実測ゲート）**: $\ell_c \in \{48, 96, 160\}\text{ px}$（$\sigma_{\text{corr}} \in \{24, 48, 80\}\text{ px}$）の 3 候補について、余白付き `2560×2560` 定常場 $X_t^{\text{raw}}$ から `2304×2304` 評価キャンバス経由で境界無欠損 `2048×2048` のつなぎ合わせ $r_t^{(1.0)}$（`[1, 4, 256, 256]`）を作成し、以下 2 指標を最優先で実測する（どちらか一方でも未達ならターゲット設計自体を見直す）：
+1. **Step 1（ターゲット品質＆窓近似検証 — 最優先の 2 大実測ゲート）**: $\ell_c \in \{48, 96, 160\}\text{ px}$（$\sigma_{\text{corr}} \in \{24, 48, 80\}\text{ px}$）の 3 候補について、余白付き `2560×2560` 定常場 $X_t^{\text{raw}}$ から `2304×2304` 評価キャンバス経由で境界無欠損 `2048×2048` のつなぎ合わせ $r_t^{(1.0)}$（`[1, 4, 256, 256]`、**20 timesteps × 対偶変量 `(+eps, -eps)` 6 ノイズ＋大域ノイズ場共有・外端フラット重み合成**）を作成し、以下 2 指標を最優先で実測する（どちらか一方でも未達ならターゲット設計自体を見直す）：
    - **窓つなぎ合わせ近似誤差ゲート**: ランダム 20 原点での直接 512 評価 $r_t$ vs 境界無欠損 $r_t^{(1.0)}$ スライスの平均コサイン類似度 **$\ge 0.90$**（未達時は報酬原点を 256px 窓格子へ固定するフォールバックを採用）。
    - **$r_t$ 空間自己相関 $\rho_{r_t}(\Delta)$**: $\Delta = 0\text{–}64\text{ px}$ で計測し、**$\rho_{r_t}(32\text{px}) \ge 0.50$ を満たす中で最も相関長が短い候補 $\ell_c^*$** を Step 2 の固定ターゲットに選定する。
-2. **Step 2（不可視性 × 保護代理指標パレートスイープ）**: 選定した単一の $\ell_c^*$ を用い、直接 PGD（$N = 100$、YCbCr $\eta_Y = 12/255, \kappa_c = 0.40$ 固定、Catmull-Rom $a = -0.5$ 拡大・Blue-noise ディザ・元解像度 $m_{\text{clip\_native}}$ 適用、$\alpha_{\text{vae}} = 0.35$ 仮固定）で $\lambda \in \{0.65, 0.72, 0.85, 1.00\}$、$\beta_{\text{chroma}} \in \{1.0, 2.0, 4.0\}$、`Standard512` vs `Bucket1024` をスイープする。
-   - **パレート選抜基準**: 不可視性下限（PSNR $\ge 35.0\text{ dB}$・LPIPS $\le 0.15$・SSIMULACRA2 $\ge 82$・平坦部 $\Delta E_{2000}$ p95 $\le 2.5$・OLED スマホ＋PC 100% 等倍目視合格）を通過した設定の中から、**安価な保護代理指標（JPEG `q=75` 後および `LPID_CropResize` 後の TRP アライメント＋Multi-VAE 潜在誘導距離）がパレート最適な上位 3 設定** を選抜する。
+2. **Step 2（不可視性 × 保護代理指標パレートスイープ）**: 選定した単一の $\ell_c^*$ を用い、直接最適化（$N = 100$、**Projected Adam ＋ `Identity` 併用 EoT 更新**、YCbCr $\eta_Y = 12/255, \kappa_c = 0.40$ 固定、Catmull-Rom $a = -0.5$ 拡大・Blue-noise ディザ・元解像度 $m_{\text{clip\_native}}$ 適用、512 基準正規化 $\mathcal{L}_{\text{chroma}}$、$\alpha_{\text{vae}} = 0.35$ 仮固定）で $\lambda \in \{0.65, 0.72, 0.85, 1.00\}$、$\beta_{\text{chroma}} \in \{1.0, 2.0, 4.0\}$、`Standard512` vs `Bucket1024` をスイープする。
+   - **パレート選抜基準**: 不可視性下限（PSNR $\ge 35.0\text{ dB}$・LPIPS $\le 0.15$・SSIMULACRA2 $\ge 82$・**アクティブ平坦部 `(W_flat >= 0.5) & (m_clip_native > 0.05)` の $\Delta E_{2000}$ p95 $\le 2.5$ かつ Illustration ドメイン単独通過**・OLED スマホ＋PC 100% 等倍目視合格）を通過した設定の中から、**実ネイティブ出力への JPEG `q=75` 圧縮後および `LPID_CropResize` 後の固定シード期待値代理指標（TRP アライメント＋Multi-VAE 内訳 `sd15`/`sdxl`/`flux`＋任意でオリジナル SDXL VAE 転移度）がパレート最適な上位設定（`Standard512` / `Bucket1024` 双方の上位枠を含むトップ 3）** を選抜する。
 
-#### Phase 0b: 模擬 LoRA 攻撃＆因子分解スイープ（計 540 LoRA 学習・A100 約 70〜85 GPU 時間 / 3.0〜3.5 日）
-`trainer/holoveil_train/poc_lora_eval.py` で、9 サブジェクト × **独立シード 3 本**（＝1 攻撃条件あたり 27 試行）に対し、各パラメータを効く攻撃条件へ限定した **因子分解スイープ** を実行する：
+#### Phase 0b: 模擬 LoRA 攻撃＆因子分解スイープ（計 540 回 + Flux スモーク検証）
+`trainer/holoveil_train/poc_lora_eval.py` で、9 サブジェクト × **独立シード 3 本** に対し、各パラメータを効く攻撃条件へ限定した **因子分解スイープ** を実行する（**保護生成時は推論と同じ中央アンカーを厳守し、同一被写体 4 枚内に混在アスペクト比を含める。LoRA 学習は `min_snr_gamma = 5.0`＋自動キャプションで統一し、各被写体の別ホールドアウト 4 枚で類似度を評価する**）：
 
 | 実験グループ | 対象攻撃条件 | 学習回数内訳 |
 | :--- | :--- | ---: |
@@ -624,39 +629,43 @@ Phase 1 は以下の **コア導線** を最優先で完成させ、`FeatheredRo
 | **2. Phase 0a 選抜 3 設定**（$\alpha_{\text{vae}}=0.35, \ell_c^*$） | 全 4 条件 | `3 × 27 × 4` = **324 回** (SD1.5: 243, SDXL: 81) |
 | **3. $\alpha_{\text{vae}}$ 因子分解スイープ**（最有力 Stealth 候補、残り `{0.0, 0.70}` の 2 通り） | **SDXL 1024 条件のみ**（オリジナル `stabilityai/stable-diffusion-xl-base-1.0` VAE 評価） | `2 × 27` = **54 回** (SDXL: 54) |
 | **4. $\ell_c$ 因子分解スイープ**（最有力 Stealth 候補、残り 2 通りの $\ell_c$） | **SD 1.5 シフトクロップ (0..64px) 条件のみ** | `2 × 27` = **54 回** (SD1.5: 54) |
-| **合計** | **SD 1.5 計 378 回 (≈ 19h) + SDXL 計 162 回 (≈ 54h)** | **計 540 回 (A100 約 70〜85h)** |
+| **5. Flux スモーク検証（追加）** | 最有力設定 vs 無保護（3 被写体×1 シード） | **6 回** (Flux 16ch VAE 誘導効力確認) |
+| **合計** | **SD 1.5 計 378 回 + SDXL 計 162 回 + Flux スモーク 6 回** | **計 546 回 (A100 約 72〜88h)** |
 
-- **Go / No-Go 全体指標の厳密定義と判定規約（統計的安定性重視）**:
-  - **全体保護改善率 $\bar{R}_c$ の集計式（1 行定義）**: 被写体 $i \in \{1, \dots, 9\}$ のドメイン固有模倣類似度 $M \in [0, 1]$（Photo は顔類似度 `FSS`、Painting / Illustration はスタイル類似度 `CSD`、ともに $\max(0, \cos)$ で非負化）に対し、各攻撃条件 $c$・被写体 $i$・独立シード $r \in \{1, 2, 3\}$ ごとの相対削減率 $R_{i, r} = (M_{i, r}^{\text{clean}} - M_{i, r}^{\text{prot}}) / \max(M_{i, r}^{\text{clean}}, 10^{-6})$ を算出し、**全 27 試行（9 被写体 × 3 シード）の等重み算術平均 $\bar{R}_c = \frac{1}{27}\sum_{i=1}^{9}\sum_{r=1}^{3} R_{i, r}$ およびその 95% 信頼区間下限（Lower 95% CI）** で合否を判定する（ドメイン別平均 $\bar{R}_{c, \text{Photo}}, \bar{R}_{c, \text{Painting}}, \bar{R}_{c, \text{Illustration}}$ は極端な破綻がないかを確認する診断参考値として併記）。
-  - **全体合否基準**: SD 1.5 無浄化 $\bar{R}_{\text{clean}} \ge 0.60$（60% 以上、診断目安: 顔 FSS $\ge 0.70$・アート CSD $\ge 0.45$）、SD 1.5 JPEG `q=75` + 0.5× リサイズ後 $\bar{R}_{\text{jpeg}} \ge 0.45$、SD 1.5 0〜64px シフトクロップ後 $\bar{R}_{\text{shift}} \ge 0.50$、SDXL オリジナル VAE 1024 バケット $\bar{R}_{\text{sdxl}} \ge 0.30$ かつ **95% 信頼区間下限 $> 0$**（ここで最終 $\alpha_{\text{vae}}, \ell_c$ を確定）。
+- **Go / No-Go 全体指標の厳密定義と判定規約（ベースライン補正＋被写体クラスタ CI）**:
+  - **ベースライン補正済み保護改善率 $R_{i, r}^{\text{cal}}$**: 各被写体 $i \in \{1, \dots, 9\}$ の未学習ベースモデル類似度 $M_i^{\text{base}}$（特に CSD はベースモデル出力間でも $M^{\text{base}} \approx 0.35\text{–}0.45$ の床を持つため）と、ドメイン固有模倣類似度 $M \in [0, 1]$（Photo: 顔 `FSS`、Painting / Illustration: スタイル `CSD`）を用い、過剰模倣利得に対する補正削減率を主指標とする（生の相対削減率 $R_{i, r}$ も併記）：
+    $$R_{i, r}^{\text{cal}} = \frac{M_{i, r}^{\text{clean}} - M_{i, r}^{\text{prot}}}{\max(M_{i, r}^{\text{clean}} - M_i^{\text{base}},\ 0.05)}$$
+  - **統計独立単位と 95% 信頼区間**: 同一被写体の 3 シードは独立でないため、**被写体単位平均 $\bar{R}_{c, i}^{\text{cal}} = \frac{1}{3}\sum_{r=1}^3 R_{i, r}^{\text{cal}}$（$N = 9$、自由度 8 の $t$ 分布）** から全体平均 $\bar{R}_c^{\text{cal}}$ および Lower 95% CI を算出する（ドメイン別平均も診断参考値として併記）。
+  - **全体合否基準**: SD 1.5 無浄化 $\bar{R}_{\text{clean}}^{\text{cal}} \ge 0.60$（60% 以上、参考生値 $\bar{R}_{\text{clean}}$: 顔 FSS $\ge 0.70$・アート CSD $\ge 0.45$）、SD 1.5 JPEG `q=75` + 0.5× リサイズ後 $\bar{R}_{\text{jpeg}}^{\text{cal}} \ge 0.45$、SD 1.5 0〜64px シフトクロップ後 $\bar{R}_{\text{shift}}^{\text{cal}} \ge 0.50$、SDXL オリジナル VAE 1024 バケット $\bar{R}_{\text{sdxl}}^{\text{cal}} \ge 0.30$ かつ **$N=9$ 被写体単位 95% 信頼区間下限 $> 0$**（ここで最終 $\alpha_{\text{vae}}, w_{\text{Flux}}, \ell_c$ を確定）。
 
 #### Phase 0c: 早期ミニ蒸留アブレーション & 誤 $r_t$ 対照実験（A100 約 3〜4 時間）
-- `trainer/holoveil_train/poc_mini_distill.py` で、教師データ **1,000 枚** を用いて `HoloveilUNet` を短期蒸留し、以下 3 条件を任意アスペクト比（`352×512`, `512×512`, `768×1024`）で比較する：
+- `trainer/holoveil_train/poc_mini_distill.py` で、教師データ **1,000 枚** を用いて `HoloveilUNet` を短期蒸留し、以下 4 条件（対照条件は推論時差し替えのみで検証）を任意アスペクト比（`352×512`, `512×512`, `768×1024`）で比較する：
   1. **`cond_proj` ON + 正しい $\tilde{r}_t^{\text{true}}$**
   2. **`cond_proj` OFF**（空間ターゲットなし）
-  3. **因果検証対照（`cond_proj` ON + 別原点から切り抜いた誤 $\tilde{r}_t^{\text{wrong}}$）**
-- **合格基準**: (a) ON が OFF より有意に高い $\langle r_p, r_t^{\text{true}} \rangle$ を達成すること、**かつ** (b) 誤 $\tilde{r}_t^{\text{wrong}}$ を与えたときに $r_t^{\text{true}}$ とのアライメントが大きく低下し、代わりに **与えた $r_t^{\text{wrong}}$ 方向へのアライメントが有意に上昇する** こと（モデルが単なる容量増加ではなく実際に空間ターゲットマップを読んでいる因果証明）。
+  3. **因果検証対照 A（符号反転 $-\tilde{r}_t^{\text{true}}$）**
+  4. **因果検証対照 B（$(+1024\text{px}, +1024\text{px})$ 離隔位置から切り抜いた無相関 $\tilde{r}_t^{\text{wrong}}$）**
+- **合格基準**: (a) ON が OFF より有意に高い $\langle r_p, r_t^{\text{true}} \rangle$ を達成し、(b) 符号反転入力に対して $\langle r_p, r_t^{\text{true}} \rangle$ が正から負へ反転し、(c) 離隔 $\tilde{r}_t^{\text{wrong}}$ 入力時に $r_t^{\text{true}}$ アライメントが大幅低下して与えた $r_t^{\text{wrong}}$ 方向へ有意に上昇すること。
 - **成果物**: `docs/POC_REPORT.md`（Stealth 確定 $\lambda$・同一マスク条件の PGD ベースライン値を記録）。
 
 ### Phase 1: Pure Rust コア・CLI 先行開発・コア GUI 疎通
-- [ ] **Workspace 初期化**: `cargo add` で実在最新安定版を解決し `Cargo.lock` 固定。`MIT OR Apache-2.0` と `MODEL_LICENSE` 雛形を配置。
-- [ ] **`holoveil-core` 実装**: `HoloveilUNet`（20.88M, `cond_proj`, `Q_chunk=256`）、`CosineDdpmScheduler`、`sampler.rs`、`color.rs`、`domain_classifier.rs`、`image_ops/{io,resample,mask,inject,jpeg_sim}.rs`、`metrics/`。
+- [ ] **Workspace 初期化**: `cargo add` で実在最新安定版を解決し `Cargo.lock` 固定（`holoveil-cli`/`holoveil-gui` は `mimalloc` グローバルアロケータ導入推奨）。`MIT OR Apache-2.0` と `MODEL_LICENSE` 雛形を配置。
+- [ ] **`holoveil-core` 実装**: `HoloveilUNet`（20.88M, `cond_proj`, `Q_chunk=256`）、`CosineDdpmScheduler`、`sampler.rs`、`color.rs`、`domain_classifier.rs`、`image_ops/{io,resample,mask,inject,jpeg_sim}.rs`（`resample.rs` は Python 同一の分離 1D `AreaBox`/`Bilinear`/`CatmullRom`、丸めは `floor(x+0.5)`）、`metrics/`。
 - [ ] **`holoveil-cli` 先行実装 & 実測検証**:
   - `protect`, `gen-dummy`, `verify-parity`, `bench-mem`, `verify-icc`。
-  - **必須実測**: (1) CPU F32 総 RSS **`512² < 700 MB`、`Bucket1024 (832×1216) < 2.4 GB`** かつ Attention `< 80 MB`、(2) PNG/JPEG/WebP の ICC 往復保持確認、(3) CPU 生成ダミー `golden_test.safetensors` による **Test M / A / B / C** 全合格。
+  - **必須実測**: (1) CPU F32 総 RSS **`512² < 700 MB`、`Bucket1024 (832×1248) < 2.4 GB`** かつ Attention `< 80 MB`、(2) PNG/JPEG/WebP の ICC 往復保持確認、(3) CPU 生成ダミー `golden_test.safetensors` による **Test M / A / B / C** 全合格。
 - [ ] **`holoveil-gui` コア導線実装**: プリセット、3 ピルドメイン選択（自動提案付）、`ScaleTarget`、`texture_adaptive`、`anti_clamp_native`、Drag&Drop キュー、非同期ワーカー＋キャンセル、比較スライダー、増幅差分ノイズ ($\times 15$)、**JPEG q75 再圧縮プレビュー**、PSNR/SSIM/RGB Max|δ|/ICC 表示、二重保護警告＆限界説明。
 - **Phase 1.5（Phase 1 完了直後のサブステップ）**: `FeatheredRoi` のマウス矩形ドラッグ編集 UI とマスク半透明オーバーレイを追加。
 
 ### Phase 2: 本学習パイプライン実行（Colab / GPU サーバ）と実重み統合
 - [ ] クリーンルーム `MultiDomainDataset`（著作権・肖像権・許諾台帳付き）の整備と評価セット分離。
 - [ ] 余白付き `2560×2560` $X_t^{\text{raw}}$ から境界無欠損 `2048×2048` マスターおよび **9 段階離散スケールキャッシュ**（$s \in \{0.50, 1.00, 1.15, 1.30, 1.50, 1.75, 2.00, 2.25, 2.50\}$、実効倍率 $s_{\text{eff}} = L_s/2048$ を metadata 記録）と単位分散正規化 $\tilde{r}_t^{\text{master}}$ を生成。
-- [ ] Stage 1a: `gen_teacher.py`（ミニバッチ $B=8$・2048 全体ランダム原点・SD 1.5 EMA 正規化 TRP + $\mathcal{L}_{\text{chroma}}$・Early Stop・SSD `.npy` シャード）。
+- [ ] Stage 1a: `gen_teacher.py`（ミニバッチ $B=8$・2048 全体ランダム原点・Projected Adam / MI-FGSM・SD 1.5 EMA 正規化 TRP + 512 基準 $\mathcal{L}_{\text{chroma}}$・Early Stop・SSD `.npy` シャード）。
 - [ ] Stage 1b: `train_distill.py`（16 倍数マルチアスペクト蒸留・単位分散正規化 `cond_proj` 注入・100 ep・EMA `0.9999`）。
-- [ ] Stage 2: `train_par.py`（可変 `{5, 10, 25}`・$\lambda \sim \mathcal{U}[0.60, 1.00]$ 条件・80% 512 級 + 20% 768〜1216 級バケット・2048 全体ランダム原点・出力 8-bit ディザ STE・`Downscale05x_SD15` 含むバケット別浄化プール・起動時 VRAM 実測検証済み勾配チェックポイント＋逐次逆伝播 Multi-VAE・5 ep）。
+- [ ] Stage 2: `train_par.py`（可変 `{5, 10, 25}` 全域ロールアウト・$\lambda \sim \mathcal{U}[0.60, 1.00]$ 条件・80% 512 級 + 20% 768〜1216/1248 級バケット・2048 全体ランダム原点・出力 8-bit ディザ STE・`Downscale05x_SD15` 含むバケット別浄化プール・起動時 VRAM 実測検証済み勾配チェックポイント＋逐次逆伝播 Multi-VAE・5 ep）。
 - [ ] `export_safetensors.py` で `holoveil_v1.safetensors`（UNet FP16 + 単位分散正規化 `cond.target_residual_master` F32 + 正規化係数 metadata, ~42.8 MB）と CPU 生成実重み `golden_test.safetensors` を出力し、`holoveil-cli verify-parity`（CPU F32 / Metal F16 / CUDA F16）を実行。
 - **Phase 2 完了ゲート（すべて達成で Phase 3 へ）**:
-  1. **同一条件保護維持率ゲート**: Phase 0b と同一プロトコル・同一 27 試行相対削減率指標 $\bar{R}_c$（SD 1.5 & オリジナル VAE SDXL、各 3 シード以上）において、学習済み U-Net の **Stealth 設定（$\lambda = 0.72$, マスク有効）が、同一 $\lambda = 0.72$・同一マスクで実施した Phase 0 直接 PGD の保護改善率に対し $\bar{R}_c^{\text{UNet}} / \bar{R}_c^{\text{PGD}} \ge 0.70$（70% 以上）を保持** すること（全体基準合格＋全 3 ドメイン破綻なし）。
-  2. **スペクトル健全性ゲート**: 全 3 ドメインで **$\rho_{\text{LF}} \ge 0.88$（512 基準 $f_r \le 0.11\text{ cycles/px}$）** を達成し、かつ 2D FFT で `PixelShuffle(2)` 由来の 2×2 格子周波数（$f = 0.5\text{ cycles/px}$）に異常ピークがないこと。
+  1. **同一条件保護維持率ゲート**: Phase 0b と同一プロトコル・同一ベースライン補正指標 $\bar{R}_c^{\text{cal}}$（SD 1.5 & オリジナル VAE SDXL、各 3 シード以上）において、学習済み U-Net の **Stealth 設定（$\lambda = 0.72$, マスク有効）が、同一 $\lambda = 0.72$・同一マスクで実施した Phase 0 直接最適化の保護改善率に対し $\bar{R}_c^{\text{UNet}} / \bar{R}_c^{\text{PGD}} \ge 0.70$（70% 以上）を保持** すること（全体基準合格＋全 3 ドメイン破綻なし）。
+  2. **スペクトル健全性ゲート**: 全 3 ドメインで **$\rho_{\text{LF}} \ge 0.88$（512 基準 $f_r \le 0.11\text{ cycles/px}$）** を達成し、かつ **作業グリッド原生解像度 $(H_w, W_w)$** の 2D FFT で `PixelShuffle(2)` 由来の 2×2 格子周波数（$f = 0.5\text{ cycles/px}$）に異常ピークがないこと。
   3. **パリティ & 速度ゲート**: Test M / A / B / C 全合格、および実測速度・メモリが目標レンジ内であること。
 
 ### Phase 3: 画質・耐性ベンチマーク・プリセット確定 & OSS リリース

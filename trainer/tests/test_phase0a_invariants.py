@@ -1,4 +1,4 @@
-"""CPU unit tests & invariant checks for holoveil Phase 0a (DESIGN.md v0.5.2-design)."""
+"""CPU unit tests & invariant checks for holoveil Phase 0a (DESIGN.md v0.5.3-design)."""
 
 from __future__ import annotations
 
@@ -13,14 +13,16 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from holoveil_train import seed_everything
+from holoveil_train import DESIGN_VERSION, seed_everything
 from holoveil_train.color_mask import (
     BASE_ETA_Y_255,
+    DEFAULT_BLUE_NOISE_PATH,
     FIXED_CHROMA_RATIO,
     bilinear_resize,
     build_masks,
     catmull_rom_resize,
     compute_anti_clamp_mask,
+    compute_checkerboard_metrics,
     compute_flat_ciede2000_p95,
     compute_psnr,
     compute_spectral_metrics,
@@ -28,10 +30,13 @@ from holoveil_train.color_mask import (
     delta_ycbcr_to_rgb,
     exact_area_box_resize,
     flat_low_freq_chroma_loss,
+    generate_blue_noise_64x64_ranks,
     get_blue_noise_64x64,
     inject_and_quantize,
     min_pool_exact,
     rgb_to_ycbcr_net,
+    round_half_up,
+    round_mult16,
 )
 from holoveil_train.poc_screen import (
     DiffJpegSte,
@@ -47,6 +52,7 @@ from holoveil_train.rewards import (
     SyntheticDryRunSurrogate,
     build_rt_master_for_ell_c,
     build_target_cache,
+    compute_scaled_latent_slice_bounds,
     compute_stitch_coverage_stats,
     generate_stationary_field_raw,
     get_bucket1024_valid_scales,
@@ -56,6 +62,7 @@ from holoveil_train.rewards import (
     prepare_eval_canvas_for_scale,
     select_shortest_valid_ell_c,
     stitch_latent_windows,
+    verify_rt_stitch_fidelity,
 )
 
 
@@ -97,7 +104,7 @@ def test_all_9_scales_phase_preserving_and_window_coverage() -> None:
         cov = compute_stitch_coverage_stats(spec)
         assert cov["zero_missing_core_pixels"] is True, f"Uncovered core pixels at scale {s_nom}: {cov}"
         assert cov["core_min_active_windows"] >= 1
-        assert cov["core_min_weight_sum"] > 0.25
+        assert cov["core_min_weight_sum"] >= 0.999
         assert cov["min_adjacent_effective_overlap_px"] >= 128
 
     assert total_windows == 1621
@@ -562,12 +569,12 @@ def test_poc_screen_cli_dry_run_step1_and_step2(tmp_path: Path) -> None:
         rt_master = sf.get_tensor("cond.target_residual_master")
         assert abs(rt_master.std(unbiased=False).item() - 1.0) < 1e-3
 
-    # 3. Test --step2 --dry-run-synthetic with fast temporary config (subset of grid for speed)
+    # 3. Test --step2 --dry-run-synthetic across Standard512 and Bucket1024
     fast_cfg_data = json.loads(json.dumps(__import__("yaml").safe_load(cfg_path.read_text(encoding="utf-8"))))
     fast_cfg_data["step2_screen"]["pgd_steps"] = 3
-    fast_cfg_data["step2_screen"]["lambda_values"] = [0.72, 1.00]
+    fast_cfg_data["step2_screen"]["lambda_values"] = [0.72]
     fast_cfg_data["step2_screen"]["beta_chroma_values"] = [1.0]
-    fast_cfg_data["step2_screen"]["scale_targets"] = ["Standard512"]
+    fast_cfg_data["step2_screen"]["scale_targets"] = ["Standard512", "Bucket1024"]
     fast_cfg_data["target_field"]["discrete_scales"] = [0.50, 1.00, 1.15, 1.50, 1.75, 2.00]
     fast_cfg_path = tmp_path / "fast_phase0a.yaml"
     fast_cfg_path.write_text(__import__("yaml").safe_dump(fast_cfg_data), encoding="utf-8")
@@ -586,6 +593,118 @@ def test_poc_screen_cli_dry_run_step1_and_step2(tmp_path: Path) -> None:
     )
     assert rc2 == 0
     s2_json = json.loads((out_dir / "step2_report.json").read_text(encoding="utf-8"))
+    assert s2_json["design_version"] == DESIGN_VERSION
     assert s2_json["dry_run_synthetic"] is True
+    assert s2_json["optimizer"] == "projected_adam"
+    assert s2_json["eot_always_include_identity"] is True
     assert len(s2_json["all_configs"]) == 2
+    assert set(s2_json["top_by_scale_target"].keys()) == {"Standard512", "Bucket1024"}
+    for rec in s2_json["all_configs"]:
+        assert "proxy_vae_breakdown_jpeg75" in rec
+        assert "sd15" in rec["proxy_vae_breakdown_jpeg75"]
+        assert "mean_work_checkerboard_peak_to_median" in rec
+        assert "passes_illustration_gates" in rec
     assert (out_dir / "step2_report.md").exists()
+
+
+def test_round_half_up_parity_and_work_grid_edge_cases() -> None:
+    # Python round(22.5)==22 (banker's), whereas floor(22.5+0.5)==23 matching Rust f64::round()
+    assert round_half_up(22.5) == 23
+    assert round_mult16(360.0) == 368
+    assert compute_work_grid(2000, 3000, "Bucket1024") == (832, 1248)
+    assert compute_work_grid(120, 600, "Standard512") == (128, 640)
+    assert compute_work_grid(104, 520, "Standard512") == (112, 560)
+
+    # .5 latent boundary check under s_eff = 2.25: 2.25 * 10 / 8 = 2.8125, 2.25 * 2 / 8 = 0.5625,
+    # 2.25 * 16 / 8 = 4.5 -> must round half up to 5
+    spec_225 = get_scale_spec(2.25)
+    start, end = compute_scaled_latent_slice_bounds(16, 64, spec_225)
+    assert start == 5 and end == 69
+
+
+def test_active_flat_ciede2000_excludes_white_background() -> None:
+    # 96% pure white background (m_clip==0) + 4% interior skin patch with large color error (> 5 dE)
+    h, w = 100, 100
+    clean = torch.ones((1, 3, h, w), dtype=torch.float32)
+    clean[:, :, 40:60, 40:60] = torch.tensor([0.90, 0.78, 0.70]).view(1, 3, 1, 1)
+
+    prot = clean.clone()
+    # Strong green tint only in the interior skin patch (white background untouched)
+    prot[:, 0, 40:60, 40:60] = 0.80
+    prot[:, 1, 40:60, 40:60] = 0.88
+    prot[:, 2, 40:60, 40:60] = 0.60
+
+    m_clip = compute_anti_clamp_mask(clean)
+    w_flat = torch.ones((1, 1, h, w), dtype=torch.float32)
+
+    res = compute_flat_ciede2000_p95(clean, prot, w_flat=w_flat, m_clip_native=m_clip)
+    # Raw flat p95 is diluted by 96% zero white pixels, whereas active flat p95 catches the defect!
+    assert res["raw_flat_delta_e2000_p95"] < 1.0
+    assert res["flat_delta_e2000_p95"] > 5.0
+
+
+def test_antithetic_variates_and_global_noise_sharing() -> None:
+    # With nonzero Monte-Carlo noise perturbation, antithetic + global noise sharing cancels 1st-order noise
+    syn_noisy = SyntheticDryRunSurrogate(mc_noise_sigma=0.35)
+    x_raw, r_t_anti, _ = build_rt_master_for_ell_c(
+        ell_c_px=96,
+        surrogate=syn_noisy,
+        seed=42,
+        num_timesteps=4,
+        num_noises=4,
+        batch_size=16,
+        antithetic=True,
+        share_global_noise=True,
+    )
+    syn_clean = SyntheticDryRunSurrogate(mc_noise_sigma=0.0)
+    _, r_t_exact, _ = build_rt_master_for_ell_c(
+        ell_c_px=96,
+        surrogate=syn_clean,
+        seed=42,
+        num_timesteps=4,
+        num_noises=4,
+        batch_size=16,
+    )
+    # Exact cancellation of linear +/-eps terms!
+    assert torch.allclose(r_t_anti, r_t_exact, atol=1e-5)
+
+    stitch = verify_rt_stitch_fidelity(
+        x_raw=x_raw,
+        r_t_master=r_t_anti,
+        surrogate=syn_noisy,
+        num_samples=10,
+        seed=42,
+        num_timesteps=4,
+        num_noises=4,
+        antithetic=True,
+        share_global_noise=True,
+    )
+    assert stitch["full_64x64"]["mean"] >= 0.99
+
+
+def test_l_chroma_512_ref_and_native_grid_checkerboard() -> None:
+    # Same normalized low-frequency pattern at 512x512 and 1024x1024 yields matching L_chroma
+    base = torch.ones((1, 3, 512, 512), dtype=torch.float32) * 0.4
+    up = bilinear_resize(base, 1024, 1024)
+    w_512 = torch.ones((1, 1, 512, 512), dtype=torch.float32)
+    w_1024 = torch.ones((1, 1, 1024, 1024), dtype=torch.float32)
+    l_512 = flat_low_freq_chroma_loss(base, w_512, beta_chroma=2.0)
+    l_1024 = flat_low_freq_chroma_loss(up, w_1024, beta_chroma=2.0)
+    assert math.isclose(l_512.item(), l_1024.item(), rel_tol=1e-3)
+
+    # Non-square 352x512 2x2 checkerboard pattern must be caught directly on native working grid
+    chk = torch.zeros((1, 3, 352, 512), dtype=torch.float32)
+    yy = torch.arange(352).view(1, 1, 352, 1)
+    xx = torch.arange(512).view(1, 1, 1, 512)
+    chk[:, :, :, :] = ((yy + xx) % 2) * 2.0 - 1.0
+    m_chk = compute_checkerboard_metrics(chk)
+    assert m_chk["work_checkerboard_f05_exact_ratio"] > 0.95
+    assert m_chk["work_checkerboard_f05_peak_to_median"] > 1e6
+
+
+def test_blue_noise_8kb_u16le_asset_parity() -> None:
+    assert DEFAULT_BLUE_NOISE_PATH.is_file()
+    assert DEFAULT_BLUE_NOISE_PATH.stat().st_size == 8192
+    bn_loaded = get_blue_noise_64x64()
+    bn_gen = generate_blue_noise_64x64_ranks().astype(np.float32) / 4096.0
+    assert np.array_equal(bn_loaded, bn_gen)
