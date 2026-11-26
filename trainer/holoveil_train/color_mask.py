@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
@@ -324,12 +325,17 @@ def catmull_rom_resize(
 # ---------------------------------------------------------------------------
 
 
+def round_half_up(val: float) -> int:
+    """Round half up via floor(val + 0.5) so Python and Rust agree identically at .5 boundaries."""
+    return int(math.floor(float(val) + 0.5))
+
+
 def round_mult16(val: float) -> int:
-    return max(16, int(round(val / 16.0)) * 16)
+    return max(16, round_half_up(val / 16.0) * 16)
 
 
 def round_mult8(val: float) -> int:
-    return max(8, int(round(val / 8.0)) * 8)
+    return max(8, round_half_up(val / 8.0) * 8)
 
 
 def compute_work_grid(orig_h: int, orig_w: int, scale_target: ScaleTargetType = "Standard512") -> tuple[int, int]:
@@ -343,8 +349,8 @@ def compute_work_grid(orig_h: int, orig_w: int, scale_target: ScaleTargetType = 
         long_w = 512
         short_w = round_mult16(512.0 * short_orig / long_orig)
         if short_w < 256:
-            # Extreme aspect ratio handling (e.g. 600x3000 -> 256x1280)
-            short_w = 256
+            # Extreme aspect ratio handling (e.g. 600x3000 -> 256x1280; avoid over-upscaling tiny images)
+            short_w = min(256, max(64, round_mult16(short_orig)))
             long_w = round_mult16(short_w * long_orig / short_orig)
         return (long_w, short_w) if orig_h >= orig_w else (short_w, long_w)
 
@@ -355,7 +361,7 @@ def compute_work_grid(orig_h: int, orig_w: int, scale_target: ScaleTargetType = 
         if min(h_w, w_w) < 256:
             long_orig = max(orig_h, orig_w)
             short_orig = min(orig_h, orig_w)
-            short_w = 256
+            short_w = min(256, max(64, round_mult16(short_orig)))
             long_w = round_mult16(short_w * long_orig / short_orig)
             return (long_w, short_w) if orig_h >= orig_w else (short_w, long_w)
         return (h_w, w_w)
@@ -419,10 +425,10 @@ def compute_texture_and_flat_mask(
     else:
         if h >= w:
             ref_h = ref_long_side
-            ref_w = max(1, int(round(ref_long_side * w / float(h))))
+            ref_w = max(1, round_half_up(ref_long_side * w / float(h)))
         else:
             ref_w = ref_long_side
-            ref_h = max(1, int(round(ref_long_side * h / float(w))))
+            ref_h = max(1, round_half_up(ref_long_side * h / float(w)))
         if long_side > ref_long_side:
             rgb_ref = exact_area_box_resize(x, ref_h, ref_w)
         else:
@@ -523,7 +529,11 @@ def build_masks(
     if texture_adaptive:
         m_tex_ref, w_flat_ref = compute_texture_and_flat_mask(x)
     else:
-        ref_h, ref_w = (512, max(1, round(512 * w / h))) if h >= w else (max(1, round(512 * h / w)), 512)
+        ref_h, ref_w = (
+            (512, max(1, round_half_up(512 * w / float(h))))
+            if h >= w
+            else (max(1, round_half_up(512 * h / float(w))), 512)
+        )
         m_tex_ref = torch.ones((b, 1, ref_h, ref_w), device=x.device, dtype=x.dtype)
         w_flat_ref = torch.ones((b, 1, ref_h, ref_w), device=x.device, dtype=x.dtype)
 
@@ -581,15 +591,14 @@ def _torus_gaussian_kernel_64(sigma: float = 1.5) -> np.ndarray:
     return kernel
 
 
-@lru_cache(maxsize=1)
-def get_blue_noise_64x64() -> np.ndarray:
-    """Deterministic Ulichney (1993) Void-and-Cluster 64x64 Blue-Noise threshold matrix in [0, 1).
+DEFAULT_BLUE_NOISE_PATH = Path(__file__).resolve().parents[2] / "assets" / "blue_noise_64x64_u16le.bin"
 
-    Returns float32 array of shape (64, 64) containing a permutation of {0..4095} / 4096.0.
-    """
+
+def generate_blue_noise_64x64_ranks() -> np.ndarray:
+    """Deterministic Ulichney (1993) Void-and-Cluster 64x64 permutation ranks in {0..4095} (uint16)."""
     n = 64
     total = n * n
-    n_init = int(round(total * 0.10))  # ~10% initial seed points
+    n_init = round_half_up(total * 0.10)  # ~10% initial seed points
     rng = np.random.Generator(np.random.PCG64(42))
 
     kernel = _torus_gaussian_kernel_64(sigma=1.5)
@@ -659,7 +668,26 @@ def get_blue_noise_64x64() -> np.ndarray:
         rank[cy, cx] = r
         _remove_point(inv_e, inv_bin, int(cy), int(cx))
 
-    return (rank.astype(np.float32)) / float(total)
+    return rank.astype("<u2")
+
+
+def export_blue_noise_u16le_bin(output_path: str | Path = DEFAULT_BLUE_NOISE_PATH) -> Path:
+    """Write the 64x64 Blue-Noise table as an 8,192-byte u16 little-endian binary asset."""
+    p = Path(output_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    ranks = generate_blue_noise_64x64_ranks()
+    p.write_bytes(ranks.tobytes(order="C"))
+    return p
+
+
+@lru_cache(maxsize=1)
+def get_blue_noise_64x64() -> np.ndarray:
+    """Load 64x64 Blue-Noise threshold matrix in [0, 1) from 8KB u16 LE asset if present, else generate."""
+    if DEFAULT_BLUE_NOISE_PATH.is_file() and DEFAULT_BLUE_NOISE_PATH.stat().st_size == 64 * 64 * 2:
+        ranks = np.frombuffer(DEFAULT_BLUE_NOISE_PATH.read_bytes(), dtype="<u2").reshape(64, 64)
+    else:
+        ranks = generate_blue_noise_64x64_ranks()
+    return ranks.astype(np.float32) / float(64 * 64)
 
 
 def get_blue_noise_tile(height: int, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -782,16 +810,35 @@ def flat_low_freq_chroma_loss(
     w_flat: torch.Tensor,
     beta_chroma: float,
     sigma: float = CHROMA_LP_SIGMA,
+    ref_long_side: int = TEX_REF_LONG_SIDE,
 ) -> torch.Tensor:
-    """Compute L_chroma per DESIGN.md §3.4.1:
+    """Compute L_chroma on the fixed 512-reference grid in normalized perturbation space (§3.4.1 v0.5.3).
 
-    L_chroma(delta_eff) = beta_chroma / (2 H W) * sum_{c in {Cb, Cr}} || W_flat * LP_{sigma=3.0}(delta_eff, c) ||_2^2.
+    L_chroma(tilde_delta_eff) = beta_chroma / (2 H_ref W_ref) *
+        sum_{c in {Cb, Cr}} || W_flat_ref * LP_{sigma=3.0}(tilde_delta_eff_ref, c) ||_2^2.
     """
     d_4d, _ = _ensure_4d(delta_eff)
     wf_4d, _ = _ensure_4d(w_flat.to(device=d_4d.device, dtype=d_4d.dtype))
-    if wf_4d.shape[-2:] != d_4d.shape[-2:]:
-        wf_4d = bilinear_resize(wf_4d, d_4d.shape[-2], d_4d.shape[-1])
-    chroma = d_4d[:, 1:3]
+
+    _, _, h, w = d_4d.shape
+    if max(h, w) > ref_long_side:
+        if h >= w:
+            ref_h = ref_long_side
+            ref_w = max(1, round_half_up(ref_long_side * w / float(h)))
+        else:
+            ref_w = ref_long_side
+            ref_h = max(1, round_half_up(ref_long_side * h / float(w)))
+        d_ref = exact_area_box_resize(d_4d, ref_h, ref_w)
+    else:
+        d_ref = d_4d
+
+    if wf_4d.shape[-2:] != d_ref.shape[-2:]:
+        if wf_4d.shape[-2] >= d_ref.shape[-2] and wf_4d.shape[-1] >= d_ref.shape[-1]:
+            wf_4d = exact_area_box_resize(wf_4d, d_ref.shape[-2], d_ref.shape[-1])
+        else:
+            wf_4d = bilinear_resize(wf_4d, d_ref.shape[-2], d_ref.shape[-1])
+
+    chroma = d_ref[:, 1:3]
     lp_chroma = gaussian_lowpass_2d(chroma, sigma=sigma)
     weighted = wf_4d * lp_chroma
     return float(beta_chroma) * (weighted * weighted).mean()
@@ -962,36 +1009,56 @@ def compute_flat_ciede2000_p95(
     clean_01: torch.Tensor,
     prot_01: torch.Tensor,
     w_flat: torch.Tensor | None = None,
+    m_clip_native: torch.Tensor | None = None,
+    alpha_mask: torch.Tensor | None = None,
     flat_threshold: float = 0.5,
+    active_clip_threshold: float = 0.05,
 ) -> dict[str, float]:
-    """Compute CIEDE2000 p95 over flat regions (W_flat >= flat_threshold) and all pixels."""
+    """Compute CIEDE2000 p95 over active flat regions ((W_flat >= 0.5) & (m_clip_native > 0.05)).
+
+    Excluding clipped pure-white/black regions prevents white backgrounds from diluting flat
+    color-shift defects on interior skin/clothing regions (v0.5.3 fix).
+    """
     de_map = compute_ciede2000_map(clean_01, prot_01)
     all_p95 = float(np.percentile(de_map, 95.0))
     all_mean = float(np.mean(de_map))
+
+    active_mask = np.ones_like(de_map, dtype=bool)
+    if m_clip_native is not None:
+        mc, _ = _ensure_4d(m_clip_native.detach().cpu())
+        if mc.shape[-2:] != de_map.shape[-2:]:
+            mc = min_pool_exact(mc, de_map.shape[-2], de_map.shape[-1])
+        active_mask &= mc[:, 0].numpy() > float(active_clip_threshold)
+    if alpha_mask is not None:
+        am, _ = _ensure_4d(alpha_mask.detach().cpu())
+        active_mask &= am[:, 0].numpy() > 0.0
 
     if w_flat is not None:
         wf, _ = _ensure_4d(w_flat.detach().cpu())
         if wf.shape[-2:] != de_map.shape[-2:]:
             wf = bilinear_resize(wf, de_map.shape[-2], de_map.shape[-1])
         wf_np = wf[:, 0].numpy()
-        flat_mask = wf_np >= flat_threshold
-        if np.any(flat_mask):
-            flat_vals = de_map[flat_mask]
-            flat_p95 = float(np.percentile(flat_vals, 95.0))
-            flat_mean = float(np.mean(flat_vals))
-            flat_frac = float(np.mean(flat_mask))
-        else:
-            flat_p95 = all_p95
-            flat_mean = all_mean
-            flat_frac = 0.0
+        raw_flat_mask = wf_np >= flat_threshold
+        active_flat_mask = raw_flat_mask & active_mask
     else:
-        flat_p95 = all_p95
-        flat_mean = all_mean
-        flat_frac = 1.0
+        raw_flat_mask = np.ones_like(de_map, dtype=bool)
+        active_flat_mask = active_mask
+
+    raw_flat_p95 = float(np.percentile(de_map[raw_flat_mask], 95.0)) if np.any(raw_flat_mask) else all_p95
+    if np.any(active_flat_mask):
+        flat_vals = de_map[active_flat_mask]
+        flat_p95 = float(np.percentile(flat_vals, 95.0))
+        flat_mean = float(np.mean(flat_vals))
+        flat_frac = float(np.mean(active_flat_mask))
+    else:
+        flat_p95 = 0.0
+        flat_mean = 0.0
+        flat_frac = 0.0
 
     return {
         "flat_delta_e2000_p95": flat_p95,
         "flat_delta_e2000_mean": flat_mean,
+        "raw_flat_delta_e2000_p95": raw_flat_p95,
         "all_delta_e2000_p95": all_p95,
         "flat_pixel_fraction": flat_frac,
     }
@@ -1019,15 +1086,39 @@ def compute_delta_stats(clean_01: torch.Tensor, prot_01: torch.Tensor) -> dict[s
     }
 
 
+def compute_checkerboard_metrics(delta_work: torch.Tensor) -> dict[str, float]:
+    """Monitor PixelShuffle(2) 2x2 grid harmonic (f=0.5 cycles/px) directly on native working grid (H_w, W_w)."""
+    d, _ = _ensure_4d(delta_work.detach().to(torch.float64))
+    _, _, h, w = d.shape
+    fft = torch.fft.fft2(d, dim=(-2, -1))
+    power = (fft.real**2 + fft.imag**2).sum(dim=1)  # [B, H, W]
+
+    fu = torch.fft.fftfreq(h, d=1.0, device=d.device, dtype=torch.float64)
+    fv = torch.fft.fftfreq(w, d=1.0, device=d.device, dtype=torch.float64)
+    total_power = power.sum(dim=(-2, -1)).clamp_min(1e-12)
+
+    nyq_mask = (torch.abs(fu[:, None]) >= 0.45) | (torch.abs(fv[None, :]) >= 0.45)
+    nyq_band_ratio = float((power[:, nyq_mask].sum(dim=-1) / total_power).mean().item())
+
+    iu = int(torch.argmax(torch.abs(fu)).item())
+    iv = int(torch.argmax(torch.abs(fv)).item())
+    p_05_05 = power[:, iu, iv]
+    p_05_00 = power[:, iu, 0]
+    p_00_05 = power[:, 0, iv]
+    nyq_exact_max = torch.maximum(p_05_05, torch.maximum(p_05_00, p_00_05))
+    median_power = power.flatten(1).median(dim=-1).values.clamp_min(1e-12)
+    return {
+        "work_nyquist_band_ratio": nyq_band_ratio,
+        "work_checkerboard_f05_exact_ratio": float(((p_05_05 + p_05_00 + p_00_05) / total_power).mean().item()),
+        "work_checkerboard_f05_peak_to_median": float((nyq_exact_max / median_power).mean().item()),
+    }
+
+
 def compute_spectral_metrics(
     delta_rgb_or_y: torch.Tensor,
     lf_cutoff_cycles_per_px: float = 0.11,
 ) -> dict[str, float]:
-    """Compute 512-normalized low-frequency energy ratio rho_LF and 2x2 grid f=0.5 peak checks (§0.2.2, §2.2).
-
-    Inputs are resampled to a 512x512 reference grid via Exact Area Box (down) / Bilinear (up)
-    when dimensions differ from 512x512, matching the 512-grid definition in DESIGN.md §0.2.2.
-    """
+    """Compute 512-normalized low-frequency energy ratio rho_LF (§0.2.2) and grid metrics."""
     d, _ = _ensure_4d(delta_rgb_or_y.detach().to(torch.float64))
     _, _, h, w = d.shape
     if (h, w) != (512, 512):
@@ -1050,29 +1141,38 @@ def compute_spectral_metrics(
     lf_power = power[:, lf_mask].sum(dim=-1)
     rho_lf = float((lf_power / total_power).mean().item())
 
-    # Monitor 2x2 checkerboard / Nyquist grid artifact near f = 0.5 cycles/px
-    nyq_mask = (torch.abs(fu[:, None]) >= 0.45) | (torch.abs(fv[None, :]) >= 0.45)
-    nyq_band_ratio = float((power[:, nyq_mask].sum(dim=-1) / total_power).mean().item())
-
-    # Exact f=0.5 indices in 512x512 FFT: 256 corresponds to -0.5 cycles/px
-    p_05_05 = power[:, 256, 256]
-    p_05_00 = power[:, 256, 0]
-    p_00_05 = power[:, 0, 256]
-    nyq_exact_max = torch.maximum(p_05_05, torch.maximum(p_05_00, p_00_05))
-    median_power = power.flatten(1).median(dim=-1).values.clamp_min(1e-12)
-    checker_peak_to_median = float((nyq_exact_max / median_power).mean().item())
-    checker_exact_ratio = float(((p_05_05 + p_05_00 + p_00_05) / total_power).mean().item())
-
+    checker = compute_checkerboard_metrics(d)
     return {
         "rho_lf": rho_lf,
-        "nyquist_band_ratio": nyq_band_ratio,
-        "checkerboard_f05_exact_ratio": checker_exact_ratio,
-        "checkerboard_f05_peak_to_median": checker_peak_to_median,
+        "nyquist_band_ratio": checker["work_nyquist_band_ratio"],
+        "checkerboard_f05_exact_ratio": checker["work_checkerboard_f05_exact_ratio"],
+        "checkerboard_f05_peak_to_median": checker["work_checkerboard_f05_peak_to_median"],
     }
 
 
+@lru_cache(maxsize=4)
+def _get_lpips_model(device_str: str) -> Any:
+    import lpips  # type: ignore
+
+    model = lpips.LPIPS(net="alex", verbose=False).to(torch.device(device_str))
+    model.eval()
+    return model
+
+
+@lru_cache(maxsize=4)
+def _get_ssimulacra2_metric(device_str: str) -> tuple[str, Any]:
+    try:
+        import pyiqa  # type: ignore
+
+        return ("pyiqa", pyiqa.create_metric("ssimulacra2", device=torch.device(device_str)))
+    except Exception:
+        import ssimulacra2  # type: ignore
+
+        return ("ssimulacra2", ssimulacra2)
+
+
 def evaluate_perceptual_metrics(clean_01: torch.Tensor, prot_01: torch.Tensor) -> dict[str, Any]:
-    """Evaluate optional LPIPS and SSIMULACRA2 metrics if installed and weights are available."""
+    """Evaluate cached LPIPS and SSIMULACRA2 metrics if installed and weights are available."""
     results: dict[str, Any] = {
         "lpips": None,
         "ssimulacra2": None,
@@ -1081,12 +1181,10 @@ def evaluate_perceptual_metrics(clean_01: torch.Tensor, prot_01: torch.Tensor) -
     }
     c, _ = _ensure_4d(clean_01.detach().to(torch.float32))
     p, _ = _ensure_4d(prot_01.detach().to(torch.float32))
+    dev_str = str(c.device)
 
     try:
-        import lpips  # type: ignore
-
-        model = lpips.LPIPS(net="alex", verbose=False).to(c.device)
-        model.eval()
+        model = _get_lpips_model(dev_str)
         with torch.no_grad():
             val = model(c * 2.0 - 1.0, p * 2.0 - 1.0).mean().item()
         results["lpips"] = float(val)
@@ -1095,11 +1193,16 @@ def evaluate_perceptual_metrics(clean_01: torch.Tensor, prot_01: torch.Tensor) -
         results["lpips_status"] = f"unavailable:{type(exc).__name__}"
 
     try:
-        import pyiqa  # type: ignore
+        kind, metric = _get_ssimulacra2_metric(dev_str)
+        if kind == "pyiqa":
+            with torch.no_grad():
+                val = metric(p, c).mean().item()
+        else:
+            from PIL import Image
 
-        metric = pyiqa.create_metric("ssimulacra2", device=c.device)
-        with torch.no_grad():
-            val = metric(p, c).mean().item()
+            c_u8 = (c[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+            p_u8 = (p[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+            val = float(metric.compute_ssimulacra2(Image.fromarray(c_u8), Image.fromarray(p_u8)))
         results["ssimulacra2"] = float(val)
         results["ssimulacra2_status"] = "ok"
     except Exception as exc:
@@ -1112,6 +1215,10 @@ def evaluate_image_quality(
     clean_01: torch.Tensor,
     prot_01: torch.Tensor,
     w_flat: torch.Tensor | None = None,
+    m_clip_native: torch.Tensor | None = None,
+    alpha_mask: torch.Tensor | None = None,
+    hat_delta_work: torch.Tensor | None = None,
+    active_clip_threshold: float = 0.05,
     include_optional_perceptual: bool = False,
 ) -> dict[str, Any]:
     """Compute complete DESIGN.md quality and spectral metrics."""
@@ -1119,9 +1226,20 @@ def evaluate_image_quality(
         "psnr_db": compute_psnr(clean_01, prot_01),
         "ssim": compute_ssim(clean_01, prot_01),
     }
-    metrics.update(compute_flat_ciede2000_p95(clean_01, prot_01, w_flat=w_flat))
+    metrics.update(
+        compute_flat_ciede2000_p95(
+            clean_01,
+            prot_01,
+            w_flat=w_flat,
+            m_clip_native=m_clip_native,
+            alpha_mask=alpha_mask,
+            active_clip_threshold=active_clip_threshold,
+        )
+    )
     metrics.update(compute_delta_stats(clean_01, prot_01))
     metrics.update(compute_spectral_metrics(prot_01 - clean_01))
+    if hat_delta_work is not None:
+        metrics.update(compute_checkerboard_metrics(hat_delta_work))
     if include_optional_perceptual:
         metrics.update(evaluate_perceptual_metrics(clean_01, prot_01))
     return metrics

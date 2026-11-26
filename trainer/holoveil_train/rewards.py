@@ -21,9 +21,11 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file as safetensors_save_file
 
+from holoveil_train import DESIGN_VERSION
 from holoveil_train.color_mask import (
     bilinear_resize,
     exact_area_box_resize,
+    round_half_up,
     round_mult8,
     round_mult16,
 )
@@ -83,7 +85,7 @@ class ScaleSpec:
 
 
 def round_mult64(val: float) -> int:
-    return max(64, int(round(val / 64.0)) * 64)
+    return max(64, round_half_up(val / 64.0) * 64)
 
 
 def build_stitch_origins_1d(l_eval: int, win_size: int = WINDOW_SIZE, stride: int = WINDOW_STRIDE) -> list[int]:
@@ -214,10 +216,18 @@ def build_latent_cosine_window(
     win_lat: int = WINDOW_SIZE // LATENT_DOWNSAMPLE,
     discard_border: int = DISCARD_LATENT_BORDER,
     ramp_len: int = RAMP_LATENT,
+    flat_top: bool = False,
+    flat_bottom: bool = False,
+    flat_left: bool = False,
+    flat_right: bool = False,
     dtype: torch.dtype = torch.float32,
     device: torch.device | str = "cpu",
 ) -> torch.Tensor:
-    """Build 2D raised-cosine stitching window [1, 1, 64, 64] with outer 8 latent px zeroed."""
+    """Build 2D raised-cosine stitching window [1, 1, 64, 64] with outer 8 latent px zeroed.
+
+    Edges touching the outer boundary of the evaluation canvas use flat 1.0 weights
+    (per v0.5.3) so every core pixel across all 9 scales achieves weight_sum >= 1.0.
+    """
     inner = win_lat - 2 * discard_border
     if inner <= 0:
         raise ValueError("discard_border too large for window size")
@@ -225,27 +235,41 @@ def build_latent_cosine_window(
     flat_len = inner - 2 * eff_ramp
 
     idx = torch.arange(eff_ramp, dtype=torch.float64, device=device)
-    left = torch.sin(math.pi * (idx + 0.5) / (2.0 * eff_ramp)) ** 2
-    right = torch.cos(math.pi * (idx + 0.5) / (2.0 * eff_ramp)) ** 2
+    sin_ramp = torch.sin(math.pi * (idx + 0.5) / (2.0 * eff_ramp)) ** 2
+    cos_ramp = torch.cos(math.pi * (idx + 0.5) / (2.0 * eff_ramp)) ** 2
+    ones_ramp = torch.ones(eff_ramp, dtype=torch.float64, device=device)
     flat = torch.ones(flat_len, dtype=torch.float64, device=device)
-    inner_1d = torch.cat([left, flat, right], dim=0)
-
     zeros = torch.zeros(discard_border, dtype=torch.float64, device=device)
-    w1d = torch.cat([zeros, inner_1d, zeros], dim=0)
-    w2d = (w1d[:, None] * w1d[None, :]).to(dtype=dtype)
+
+    def _make_1d(f_start: bool, f_end: bool) -> torch.Tensor:
+        l_seg = ones_ramp if f_start else sin_ramp
+        r_seg = ones_ramp if f_end else cos_ramp
+        return torch.cat([zeros, l_seg, flat, r_seg, zeros], dim=0)
+
+    wy = _make_1d(flat_top, flat_bottom)
+    wx = _make_1d(flat_left, flat_right)
+    w2d = (wy[:, None] * wx[None, :]).to(dtype=dtype)
     return w2d.unsqueeze(0).unsqueeze(0)
 
 
 def compute_stitch_coverage_stats(spec: ScaleSpec) -> dict[str, Any]:
-    """Verify full core coverage (>= 64px inside window, overlap >= 128px) for a ScaleSpec."""
+    """Verify full core coverage (>= 64px inside window, overlap >= 128px, weight >= 1.0) for a ScaleSpec."""
     eval_lat = spec.L_eval_s // LATENT_DOWNSAMPLE
     win_lat = WINDOW_SIZE // LATENT_DOWNSAMPLE
-    w2d = build_latent_cosine_window(win_lat=win_lat, dtype=torch.float64)[0, 0]
+    last_px = spec.L_eval_s - WINDOW_SIZE
     weight_sum = torch.zeros((eval_lat, eval_lat), dtype=torch.float64)
     active_count = torch.zeros((eval_lat, eval_lat), dtype=torch.int32)
 
     origins = build_stitch_windows(spec.L_eval_s)
     for y_px, x_px in origins:
+        w2d = build_latent_cosine_window(
+            win_lat=win_lat,
+            flat_top=(y_px == 0),
+            flat_bottom=(y_px == last_px),
+            flat_left=(x_px == 0),
+            flat_right=(x_px == last_px),
+            dtype=torch.float64,
+        )[0, 0]
         yl = y_px // LATENT_DOWNSAMPLE
         xl = x_px // LATENT_DOWNSAMPLE
         weight_sum[yl : yl + win_lat, xl : xl + win_lat] += w2d
@@ -266,8 +290,6 @@ def compute_stitch_coverage_stats(spec: ScaleSpec) -> dict[str, Any]:
     overlaps_px = [eff_width_px - (b - a) for a, b in zip(origins_1d[:-1], origins_1d[1:])]
     min_overlap_px = min(overlaps_px) if overlaps_px else eff_width_px
 
-    # Outer single-window core corners carry a single 2D cosine taper (~0.301 min weight),
-    # which is exact under acc / weight_sum normalization as long as weight > 0 and active_count >= 1.
     return {
         "s_nominal": spec.s_nominal,
         "window_count": len(origins),
@@ -275,15 +297,16 @@ def compute_stitch_coverage_stats(spec: ScaleSpec) -> dict[str, Any]:
         "core_max_weight_sum": float(core_w.max().item()),
         "core_min_active_windows": int(core_cnt.min().item()),
         "min_adjacent_effective_overlap_px": int(min_overlap_px),
-        "zero_missing_core_pixels": bool((core_cnt >= 1).all().item() and (core_w > 0.25).all().item()),
+        "zero_missing_core_pixels": bool((core_cnt >= 1).all().item() and (core_w >= 0.999).all().item()),
     }
 
 
 def stitch_latent_windows(
     x_eval: torch.Tensor,
     spec: ScaleSpec,
-    window_eval_fn: Callable[[torch.Tensor], torch.Tensor],
+    window_eval_fn: Callable[..., torch.Tensor],
     batch_size: int = 8,
+    pass_origins: bool = False,
 ) -> torch.Tensor:
     """Evaluate 512x512 overlapping windows on x_eval, cosine-blend, and slice core [16 : 16 + L_s/8]."""
     if x_eval.shape[-2:] != (spec.L_eval_s, spec.L_eval_s):
@@ -292,8 +315,8 @@ def stitch_latent_windows(
     origins = build_stitch_windows(spec.L_eval_s)
     win_lat = WINDOW_SIZE // LATENT_DOWNSAMPLE
     eval_lat = spec.L_eval_s // LATENT_DOWNSAMPLE
+    last_px = spec.L_eval_s - WINDOW_SIZE
 
-    w2d = build_latent_cosine_window(win_lat=win_lat, dtype=torch.float32, device=x_eval.device)
     acc: torch.Tensor | None = None
     weight_sum = torch.zeros((1, 1, eval_lat, eval_lat), dtype=torch.float32, device=x_eval.device)
 
@@ -303,12 +326,22 @@ def stitch_latent_windows(
             [x_eval[:, :, y : y + WINDOW_SIZE, x : x + WINDOW_SIZE] for y, x in chunk_origins],
             dim=0,
         )
-        out_lat = window_eval_fn(patches).to(device=x_eval.device, dtype=torch.float32)
+        raw_out = window_eval_fn(patches, chunk_origins) if pass_origins else window_eval_fn(patches)
+        out_lat = raw_out.to(device=x_eval.device, dtype=torch.float32)
         if acc is None:
             c_lat = out_lat.shape[1]
             acc = torch.zeros((1, c_lat, eval_lat, eval_lat), dtype=torch.float32, device=x_eval.device)
 
         for idx, (y_px, x_px) in enumerate(chunk_origins):
+            w2d = build_latent_cosine_window(
+                win_lat=win_lat,
+                flat_top=(y_px == 0),
+                flat_bottom=(y_px == last_px),
+                flat_left=(x_px == 0),
+                flat_right=(x_px == last_px),
+                dtype=torch.float32,
+                device=x_eval.device,
+            )
             yl = y_px // LATENT_DOWNSAMPLE
             xl = x_px // LATENT_DOWNSAMPLE
             acc[:, :, yl : yl + win_lat, xl : xl + win_lat] += out_lat[idx : idx + 1] * w2d
@@ -327,6 +360,55 @@ def stitch_latent_windows(
 # ---------------------------------------------------------------------------
 
 
+class GlobalStep1NoiseBank:
+    """Deterministic 320x320 global latent noise bank with antithetic (+eps, -eps) pairs for Step 1."""
+
+    def __init__(
+        self,
+        seed: int = 42,
+        num_timesteps: int = 20,
+        num_noises: int = 6,
+        antithetic: bool = True,
+        latent_size: int = RAW_SIZE // LATENT_DOWNSAMPLE,
+    ) -> None:
+        self.seed = int(seed)
+        self.num_timesteps = int(num_timesteps)
+        self.num_noises = int(num_noises)
+        self.antithetic = bool(antithetic)
+        self.latent_size = int(latent_size)
+        self._cache: dict[tuple[int, int], torch.Tensor] = {}
+
+    def _get_base_field(self, t_idx: int, pair_idx: int) -> torch.Tensor:
+        key = (t_idx, pair_idx)
+        if key not in self._cache:
+            field_seed = self.seed + t_idx * 1009 + pair_idx * 17
+            gen = torch.Generator(device="cpu").manual_seed(field_seed)
+            self._cache[key] = torch.randn((1, 4, self.latent_size, self.latent_size), generator=gen, dtype=torch.float32)
+        return self._cache[key]
+
+    def get_batch_slices(
+        self,
+        t_idx: int,
+        noise_idx: int,
+        raw_origins_px: list[tuple[int, int]],
+        patch_lat: int = WINDOW_SIZE // LATENT_DOWNSAMPLE,
+    ) -> torch.Tensor:
+        if self.antithetic:
+            pair_idx = noise_idx // 2
+            sign = -1.0 if (noise_idx % 2 == 1 and (noise_idx < (self.num_noises // 2) * 2)) else 1.0
+        else:
+            pair_idx = noise_idx
+            sign = 1.0
+        field = self._get_base_field(t_idx, pair_idx)
+        slices = []
+        for ry, rx in raw_origins_px:
+            yl = ry // LATENT_DOWNSAMPLE
+            xl = rx // LATENT_DOWNSAMPLE
+            slices.append(field[:, :, yl : yl + patch_lat, xl : xl + patch_lat])
+        out = torch.cat(slices, dim=0)
+        return out * sign if sign < 0 else out
+
+
 class SurrogateBackend(Protocol):
     """Protocol for frozen SD 1.5 surrogate & VAE evaluation (real or synthetic dry-run)."""
 
@@ -340,9 +422,12 @@ class SurrogateBackend(Protocol):
         x_m11: torch.Tensor,
         seed: int = 42,
         num_timesteps: int = 20,
-        num_noises: int = 5,
+        num_noises: int = 6,
         timestep_min: int = 25,
         timestep_max: int = 975,
+        antithetic: bool = True,
+        noise_bank: GlobalStep1NoiseBank | None = None,
+        raw_origins_px: list[tuple[int, int]] | None = None,
     ) -> torch.Tensor: ...
     def forward_trp_residual(
         self,
@@ -352,6 +437,7 @@ class SurrogateBackend(Protocol):
         use_checkpoint: bool = False,
     ) -> torch.Tensor: ...
     def encode_extra_vaes(self, x_01: torch.Tensor, use_checkpoint: bool = False) -> dict[str, torch.Tensor]: ...
+    def encode_original_sdxl_vae(self, x_01: torch.Tensor) -> torch.Tensor | None: ...
 
 
 def _resolve_hf_revision(model_id: str, obj: Any | None = None, explicit_rev: str | None = None) -> str:
@@ -385,6 +471,8 @@ class SD15MultiVaeSurrogate:
         sd15_model_id: str = "stable-diffusion-v1-5/stable-diffusion-v1-5",
         sd15_revision: str | None = None,
         sdxl_vae_id: str | None = "madebyollin/sdxl-vae-fp16-fix",
+        sdxl_original_vae_id: str | None = None,
+        sdxl_original_vae_subfolder: str = "vae",
         flux_vae_id: str | None = "black-forest-labs/FLUX.1-schnell",
         flux_vae_subfolder: str = "vae",
         device: torch.device | str | None = None,
@@ -473,6 +561,30 @@ class SD15MultiVaeSurrogate:
                 except Exception as exc:
                     self.vae_load_status["flux"] = f"unavailable:{type(exc).__name__}:{exc}"
 
+        self.original_sdxl_vae: Any | None = None
+        if load_extra_vaes and sdxl_original_vae_id:
+            try:
+                orig_vae = AutoencoderKL.from_pretrained(
+                    sdxl_original_vae_id,
+                    subfolder=sdxl_original_vae_subfolder,
+                    torch_dtype=torch.float32,
+                ).to(self.device)
+                orig_vae.eval()
+                orig_vae.requires_grad_(False)
+                self.original_sdxl_vae = orig_vae
+                self.vae_load_status["sdxl_original"] = f"loaded:{sdxl_original_vae_id}"
+            except Exception as exc:
+                self.vae_load_status["sdxl_original"] = f"unavailable:{type(exc).__name__}:{exc}"
+
+    def encode_original_sdxl_vae(self, x_01: torch.Tensor) -> torch.Tensor | None:
+        if self.original_sdxl_vae is None:
+            return None
+        x_m11 = self._to_m11(x_01, "01").to(device=self.device, dtype=torch.float32)
+        with torch.no_grad():
+            posterior = self.original_sdxl_vae.encode(x_m11).latent_dist
+            scale = float(getattr(self.original_sdxl_vae.config, "scaling_factor", 0.13025))
+            return posterior.mean * scale
+
     def _to_m11(self, x: torch.Tensor, input_range: str) -> torch.Tensor:
         if input_range == "01":
             return x * 2.0 - 1.0
@@ -518,11 +630,14 @@ class SD15MultiVaeSurrogate:
         x_m11: torch.Tensor,
         seed: int = 42,
         num_timesteps: int = 20,
-        num_noises: int = 5,
+        num_noises: int = 6,
         timestep_min: int = 25,
         timestep_max: int = 975,
+        antithetic: bool = True,
+        noise_bank: GlobalStep1NoiseBank | None = None,
+        raw_origins_px: list[tuple[int, int]] | None = None,
     ) -> torch.Tensor:
-        """Compute E_{tau, eps}[eps_SD15(z_tau, tau, c_empty) - eps] averaged over timesteps x noises."""
+        """Compute E_{tau, eps}[eps_SD15(z_tau, tau, c_empty) - eps] with antithetic variates (+eps, -eps)."""
         b = x_m11.shape[0]
         with torch.no_grad():
             z = self._encode_single_vae(self.vae, x_m11).to(torch.float32)
@@ -534,17 +649,44 @@ class SD15MultiVaeSurrogate:
             acc = torch.zeros_like(z, dtype=torch.float32)
             count = 0
 
-            for t_val in timesteps.tolist():
+            for t_idx, t_val in enumerate(timesteps.tolist()):
                 alpha_bar = self.alphas_cumprod[t_val]
                 sqrt_a = torch.sqrt(alpha_bar)
                 sqrt_one_minus_a = torch.sqrt(1.0 - alpha_bar)
                 t_tensor = torch.full((b,), int(t_val), device=self.device, dtype=torch.long)
-                for _ in range(num_noises):
-                    eps = torch.randn(z.shape, generator=gen, dtype=torch.float32).to(self.device)
-                    z_t = (sqrt_a * z + sqrt_one_minus_a * eps).to(self.dtype)
-                    pred = self.unet(z_t, t_tensor, encoder_hidden_states=cond).sample.to(torch.float32)
-                    acc += pred - eps
-                    count += 1
+
+                if noise_bank is not None and raw_origins_px is not None:
+                    for n_idx in range(num_noises):
+                        eps = noise_bank.get_batch_slices(
+                            t_idx, n_idx, raw_origins_px, patch_lat=z.shape[-1]
+                        ).to(self.device)
+                        z_t = (sqrt_a * z + sqrt_one_minus_a * eps).to(self.dtype)
+                        pred = self.unet(z_t, t_tensor, encoder_hidden_states=cond).sample.to(torch.float32)
+                        acc += pred - eps
+                        count += 1
+                elif antithetic and num_noises >= 2:
+                    n_pairs = num_noises // 2
+                    for _ in range(n_pairs):
+                        eps = torch.randn(z.shape, generator=gen, dtype=torch.float32).to(self.device)
+                        for sign in (1.0, -1.0):
+                            eps_s = eps * sign
+                            z_t = (sqrt_a * z + sqrt_one_minus_a * eps_s).to(self.dtype)
+                            pred = self.unet(z_t, t_tensor, encoder_hidden_states=cond).sample.to(torch.float32)
+                            acc += pred - eps_s
+                            count += 1
+                    if num_noises % 2 == 1:
+                        eps = torch.randn(z.shape, generator=gen, dtype=torch.float32).to(self.device)
+                        z_t = (sqrt_a * z + sqrt_one_minus_a * eps).to(self.dtype)
+                        pred = self.unet(z_t, t_tensor, encoder_hidden_states=cond).sample.to(torch.float32)
+                        acc += pred - eps
+                        count += 1
+                else:
+                    for _ in range(num_noises):
+                        eps = torch.randn(z.shape, generator=gen, dtype=torch.float32).to(self.device)
+                        z_t = (sqrt_a * z + sqrt_one_minus_a * eps).to(self.dtype)
+                        pred = self.unet(z_t, t_tensor, encoder_hidden_states=cond).sample.to(torch.float32)
+                        acc += pred - eps
+                        count += 1
 
             return acc / float(count)
 
@@ -596,15 +738,27 @@ class SyntheticDryRunSurrogate:
     Never used to fabricate real SD 1.5 measurements; outputs are clearly labeled synthetic.
     """
 
-    def __init__(self, include_extra_vaes: bool = True, device: torch.device | str = "cpu") -> None:
+    def __init__(
+        self,
+        include_extra_vaes: bool = True,
+        device: torch.device | str = "cpu",
+        mc_noise_sigma: float = 0.0,
+    ) -> None:
         self.device = torch.device(device)
         self.sd15_revision = "DRY_RUN_SYNTHETIC_NO_REAL_SD15"
+        self.mc_noise_sigma = float(mc_noise_sigma)
         self.vae_load_status: dict[str, str] = {"sd15": "synthetic_dry_run"}
         self.extra_vaes: dict[str, Any] = {}
         if include_extra_vaes:
             self.extra_vaes = {"sdxl": 4, "flux": 16}
             self.vae_load_status["sdxl"] = "synthetic_dry_run"
             self.vae_load_status["flux"] = "synthetic_dry_run"
+            self.vae_load_status["sdxl_original"] = "synthetic_dry_run"
+
+    def encode_original_sdxl_vae(self, x_01: torch.Tensor) -> torch.Tensor | None:
+        if "sdxl" not in self.extra_vaes:
+            return None
+        return self._conv_latent((x_01 * 2.0 - 1.0).to(self.device), out_ch=4)
 
     def _conv_latent(self, x_m11: torch.Tensor, out_ch: int = 4) -> torch.Tensor:
         # Smooth strided projection preserving spatial correlation of x_m11 -> 1/8 resolution
@@ -635,15 +789,48 @@ class SyntheticDryRunSurrogate:
         x_m11: torch.Tensor,
         seed: int = 42,
         num_timesteps: int = 20,
-        num_noises: int = 5,
+        num_noises: int = 6,
         timestep_min: int = 25,
         timestep_max: int = 975,
+        antithetic: bool = True,
+        noise_bank: GlobalStep1NoiseBank | None = None,
+        raw_origins_px: list[tuple[int, int]] | None = None,
     ) -> torch.Tensor:
         z = self.encode_sd15_vae(x_m11, input_range="m11")
-        # Mild local Laplacian + linear response to mimic SD 1.5 spatial context sensitivity
         pad = torch.nn.functional.pad(z, (1, 1, 1, 1), mode="replicate")
         local_avg = torch.nn.functional.avg_pool2d(pad, kernel_size=3, stride=1)
-        return 0.75 * z + 0.25 * local_avg
+        base = 0.75 * z + 0.25 * local_avg
+        if self.mc_noise_sigma <= 0.0:
+            return base
+
+        # Optional synthetic Monte-Carlo noise perturbation for testing antithetic cancellation
+        gen = torch.Generator(device="cpu").manual_seed(int(seed))
+        acc = torch.zeros_like(base)
+        count = 0
+        for t_idx in range(num_timesteps):
+            if noise_bank is not None and raw_origins_px is not None:
+                for n_idx in range(num_noises):
+                    eps = noise_bank.get_batch_slices(t_idx, n_idx, raw_origins_px, patch_lat=z.shape[-1]).to(
+                        self.device
+                    )
+                    acc += base + self.mc_noise_sigma * eps
+                    count += 1
+            elif antithetic and num_noises >= 2:
+                for _ in range(num_noises // 2):
+                    eps = torch.randn(z.shape, generator=gen, dtype=torch.float32).to(self.device)
+                    acc += base + self.mc_noise_sigma * eps
+                    acc += base - self.mc_noise_sigma * eps
+                    count += 2
+                if num_noises % 2 == 1:
+                    eps = torch.randn(z.shape, generator=gen, dtype=torch.float32).to(self.device)
+                    acc += base + self.mc_noise_sigma * eps
+                    count += 1
+            else:
+                for _ in range(num_noises):
+                    eps = torch.randn(z.shape, generator=gen, dtype=torch.float32).to(self.device)
+                    acc += base + self.mc_noise_sigma * eps
+                    count += 1
+        return acc / float(max(1, count))
 
     def forward_trp_residual(
         self,
@@ -671,8 +858,10 @@ def verify_rt_stitch_fidelity(
     seed: int = 42,
     min_cosine: float = STITCH_COSINE_THRESHOLD,
     num_timesteps: int = 20,
-    num_noises: int = 5,
+    num_noises: int = 6,
     batch_size: int = 8,
+    antithetic: bool = True,
+    share_global_noise: bool = True,
 ) -> dict[str, Any]:
     """Verify stitched r_t^(1.0) against direct 512x512 SD 1.5 evaluations at 20 random 8-aligned origins."""
     if r_t_master.shape != (1, 4, 256, 256):
@@ -685,6 +874,7 @@ def verify_rt_stitch_fidelity(
     patches = []
     slice_refs = []
     origins_px: list[tuple[int, int]] = []
+    raw_origins_px: list[tuple[int, int]] = []
 
     for i in range(num_samples):
         y_lat = int(lat_coords[i, 0].item())
@@ -695,21 +885,32 @@ def verify_rt_stitch_fidelity(
 
         raw_y = MARGIN_SIZE + y_px
         raw_x = MARGIN_SIZE + x_px
+        raw_origins_px.append((raw_y, raw_x))
         patches.append(x_raw[:, :, raw_y : raw_y + WINDOW_SIZE, raw_x : raw_x + WINDOW_SIZE])
         slice_refs.append(r_t_master[:, :, y_lat : y_lat + 64, x_lat : x_lat + 64])
 
     patches_all = torch.cat(patches, dim=0)
     refs_all = torch.cat(slice_refs, dim=0).to(torch.float64)
 
+    noise_bank = (
+        GlobalStep1NoiseBank(seed=seed, num_timesteps=num_timesteps, num_noises=num_noises, antithetic=antithetic)
+        if share_global_noise
+        else None
+    )
+
     direct_outs = []
     for start in range(0, num_samples, batch_size):
         chunk = patches_all[start : start + batch_size]
+        chunk_raw_origins = raw_origins_px[start : start + batch_size] if share_global_noise else None
         direct_outs.append(
             surrogate.compute_expected_rt(
                 chunk,
                 seed=seed + 1000 + start,
                 num_timesteps=num_timesteps,
                 num_noises=num_noises,
+                antithetic=antithetic,
+                noise_bank=noise_bank,
+                raw_origins_px=chunk_raw_origins,
             ).cpu()
         )
     direct_all = torch.cat(direct_outs, dim=0).to(torch.float64)
@@ -831,8 +1032,10 @@ def build_rt_master_for_ell_c(
     surrogate: SurrogateBackend,
     seed: int = 42,
     num_timesteps: int = 20,
-    num_noises: int = 5,
+    num_noises: int = 6,
     batch_size: int = 8,
+    antithetic: bool = True,
+    share_global_noise: bool = True,
     device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate X_t^raw, evaluate stitched boundary-free r_t^(1.0), and return (x_raw, r_t_1_0, r_t_norm)."""
@@ -840,15 +1043,29 @@ def build_rt_master_for_ell_c(
     x_raw = generate_stationary_field_raw(ell_c_px=ell_c_px, seed=seed, device=device)
     x_eval = prepare_eval_canvas_for_scale(x_raw, spec_1_0)
 
-    def _eval_fn(patches: torch.Tensor) -> torch.Tensor:
+    noise_bank = (
+        GlobalStep1NoiseBank(seed=seed, num_timesteps=num_timesteps, num_noises=num_noises, antithetic=antithetic)
+        if share_global_noise
+        else None
+    )
+
+    def _eval_fn(patches: torch.Tensor, chunk_origins: list[tuple[int, int]]) -> torch.Tensor:
+        raw_origins = (
+            [(spec_1_0.eval_slice_start + y, spec_1_0.eval_slice_start + x) for y, x in chunk_origins]
+            if share_global_noise
+            else None
+        )
         return surrogate.compute_expected_rt(
             patches,
             seed=seed,
             num_timesteps=num_timesteps,
             num_noises=num_noises,
+            antithetic=antithetic,
+            noise_bank=noise_bank,
+            raw_origins_px=raw_origins,
         )
 
-    r_t_1_0 = stitch_latent_windows(x_eval, spec_1_0, _eval_fn, batch_size=batch_size).cpu()
+    r_t_1_0 = stitch_latent_windows(x_eval, spec_1_0, _eval_fn, batch_size=batch_size, pass_origins=True).cpu()
     r_t_norm, _, _ = normalize_rt_master(r_t_1_0)
     return x_raw, r_t_1_0, r_t_norm
 
@@ -865,8 +1082,9 @@ def build_target_cache(
     scales: tuple[float, ...] = DISCRETE_SCALES,
     seed: int = 42,
     num_timesteps: int = 20,
-    num_noises: int = 5,
+    num_noises: int = 6,
     batch_size: int = 8,
+    antithetic: bool = True,
     include_extra_vaes: bool = True,
     device: torch.device | str = "cpu",
 ) -> dict[str, Any]:
@@ -888,6 +1106,7 @@ def build_target_cache(
                 seed=seed,
                 num_timesteps=num_timesteps,
                 num_noises=num_noises,
+                antithetic=antithetic,
             )
 
         r_t_s = stitch_latent_windows(x_eval, spec, _eval_rt, batch_size=batch_size).cpu().to(torch.float32)
@@ -917,7 +1136,7 @@ def build_target_cache(
     tensors["cond.target_residual_master"] = r_t_norm
 
     manifest = {
-        "design_version": "0.5.2-design",
+        "design_version": DESIGN_VERSION,
         "ell_c_px": int(ell_c_px),
         "seed": int(seed),
         "sd15_revision": getattr(surrogate, "sd15_revision", "unknown"),
@@ -932,7 +1151,7 @@ def build_target_cache(
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     st_meta = {
-        "design_version": "0.5.2-design",
+        "design_version": DESIGN_VERSION,
         "ell_c_px": str(ell_c_px),
         "sd15_revision": str(manifest["sd15_revision"]),
         "rt_norm_mean": repr(rt_mean),
@@ -988,10 +1207,10 @@ def compute_scaled_latent_slice_bounds(
     patch_lat: int,
     spec: ScaleSpec,
 ) -> tuple[int, int]:
-    """Compute guarded latent slice [start, start + patch_lat) using s_eff per DESIGN.md §5.2.3."""
+    """Compute guarded latent slice [start, start + patch_lat) using s_eff and floor(x+0.5) (§5.2.3)."""
     if patch_lat <= 0 or patch_lat > spec.L_s_lat:
         raise ValueError(f"patch_lat {patch_lat} out of valid range [1, {spec.L_s_lat}] for s={spec.s_nominal}")
-    raw_idx = int(round(spec.s_eff * float(coord_px) / float(LATENT_DOWNSAMPLE)))
+    raw_idx = round_half_up(spec.s_eff * float(coord_px) / float(LATENT_DOWNSAMPLE))
     max_start = spec.L_s_lat - patch_lat
     start = max(0, min(raw_idx, max_start))
     return start, start + patch_lat

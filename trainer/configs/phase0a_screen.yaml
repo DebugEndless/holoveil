@@ -1,16 +1,19 @@
 # Phase 0a: Target Validation & Pareto Screening Configuration
-# Conforms strictly to docs/DESIGN.md (Version 0.5.2-design)
+# Conforms strictly to docs/DESIGN.md (Version 0.5.3-design)
 
 seed: 42
-design_version: "0.5.2-design"
+design_version: "0.5.3-design"
 
 model:
   sd15_model_id: "stable-diffusion-v1-5/stable-diffusion-v1-5"
   sd15_revision: null # Resolved at runtime and logged with commit SHA
   sdxl_vae_id: "madebyollin/sdxl-vae-fp16-fix"
+  sdxl_original_vae_id: "stabilityai/stable-diffusion-xl-base-1.0"
+  sdxl_original_vae_subfolder: "vae"
   flux_vae_id: "black-forest-labs/FLUX.1-schnell"
   flux_vae_subfolder: "vae"
   enable_flux_vae: true
+  eval_original_sdxl_vae: true
   torch_dtype: "bf16" # Auto-falls back to fp32 on CPU
 
 target_field:
@@ -28,7 +31,9 @@ target_field:
   stitch_num_random_samples: 20
   stitch_min_cosine: 0.90
   rt_num_timesteps: 20
-  rt_num_noises: 5
+  rt_num_noises: 6 # 3 antithetic (+eps, -eps) pairs
+  use_antithetic_variates: true
+  share_global_noise_step1: true
   rt_timestep_min: 25
   rt_timestep_max: 975
   rt_eval_batch_size: 8
@@ -52,8 +57,11 @@ color_mask:
 
 step2_screen:
   pgd_steps: 100
-  pgd_step_size_start: 0.12
-  pgd_step_size_end: 0.02
+  optimizer: "projected_adam"
+  pgd_step_size_start: 0.08
+  pgd_step_size_end: 0.015
+  adam_betas: [0.9, 0.999]
+  eot_always_include_identity: true
   alpha_vae: 0.35
   vae_weights:
     sd15: 0.2
@@ -68,6 +76,8 @@ step2_screen:
   bucket1024_candidate_scales: [1.50, 1.75, 2.00, 2.25, 2.50]
   bucket1024_max_scaled_pixels: 1200000
   eval_jpeg_quality: 75
+  proxy_eval_timesteps: 10
+  proxy_eval_noises: 2 # 1 antithetic pair
   purification_probs_512:
     Identity: 0.15
     DiffJPEG_STE: 0.20
@@ -87,4 +97,5 @@ step2_screen:
     max_lpips: 0.15
     min_ssimulacra2: 82.0
     max_flat_delta_e2000_p95: 2.5
+    active_flat_clip_threshold: 0.05
   top_k_pareto: 3
